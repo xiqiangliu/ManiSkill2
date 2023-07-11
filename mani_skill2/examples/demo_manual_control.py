@@ -19,6 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--env-id", type=str, required=True)
     parser.add_argument("-o", "--obs-mode", type=str)
+    parser.add_argument("-kf", "--keyframe-editor", action="store_true")
     parser.add_argument("--reward-mode", type=str)
     parser.add_argument("-c", "--control-mode", type=str, default="pd_ee_delta_pose")
     parser.add_argument("--render-mode", type=str, default="cameras")
@@ -68,7 +69,10 @@ def main():
 
     # Viewer
     if args.enable_sapien_viewer:
-        env.render_human()
+        if args.keyframe_editor:
+            env.render_kf()
+        else:
+            env.render_human()
     opencv_viewer = OpenCVViewer(exit_on_esc=False)
 
     def render_wait():
@@ -91,7 +95,10 @@ def main():
         # Visualization
         # -------------------------------------------------------------------------- #
         if args.enable_sapien_viewer:
-            env.render_human()
+            if args.keyframe_editor:
+                env.render_kf()
+            else:
+                env.render_human()
 
         render_frame = env.render()
 
