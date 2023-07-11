@@ -674,8 +674,12 @@ class BaseEnv(gym.Env):
         """
         # CAUTION: call `set_scene` after assets are loaded.
         self._viewer.set_scene(self._scene)
-        self._viewer.toggle_axes(False)
-        self._viewer.toggle_camera_lines(False)
+
+        try:
+            self._viewer.toggle_axes(False)
+            self._viewer.toggle_camera_lines(False)
+        except AttributeError:
+            pass
 
     def render(self, mode="human", **kwargs):
         self.update_render()
@@ -684,6 +688,19 @@ class BaseEnv(gym.Env):
                 self._viewer = Viewer(self._renderer)
                 self._setup_viewer()
             self._viewer.render()
+            return self._viewer
+        elif mode == "human_kf":
+            from sapien.utils.viewer.plugin import Plugin
+
+            from mani_skill2.utils.visualization.keyframe_editor import KeyframeWindow
+
+            if self._viewer is None:
+                _plugins: list[Plugin] = Viewer.__init__.__defaults__[-1] + [
+                    KeyframeWindow
+                ]
+                self._viewer = Viewer(self._renderer, plugins=_plugins)
+                self._setup_viewer()
+            self._viewer.render_keypoint()
             return self._viewer
         elif mode == "rgb_array":
             images = []
