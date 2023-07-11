@@ -6,6 +6,8 @@ import gym
 import numpy as np
 import sapien.core as sapien
 from sapien.utils import Viewer
+from sapien.utils.viewer.keyframe_window import KeyframeWindow
+from sapien.utils.viewer.plugin import Plugin
 
 from mani_skill2 import ASSET_DIR, logger
 from mani_skill2.agents.base_agent import AgentConfig, BaseAgent
@@ -681,6 +683,14 @@ class BaseEnv(gym.Env):
         except AttributeError:
             pass
 
+        # Store env instance in MSKeyframeWindow for keyframe editing
+        from mani_skill2.utils.visualization.keyframe_editor import MSKeyframeWindow
+
+        for plugin in self._viewer.plugins:
+            if isinstance(plugin, MSKeyframeWindow):
+                plugin.env = self
+            break
+
     def render(self, mode="human", **kwargs):
         self.update_render()
         if mode == "human":
@@ -690,17 +700,19 @@ class BaseEnv(gym.Env):
             self._viewer.render()
             return self._viewer
         elif mode == "human_kf":
-            from sapien.utils.viewer.plugin import Plugin
-
-            from mani_skill2.utils.visualization.keyframe_editor import KeyframeWindow
+            from mani_skill2.utils.visualization.keyframe_editor import MSKeyframeWindow
 
             if self._viewer is None:
-                _plugins: list[Plugin] = Viewer.__init__.__defaults__[-1] + [
-                    KeyframeWindow
-                ]
+                _plugins: list[Plugin] = Viewer.__init__.__defaults__[-1]
+                for i, plugin in enumerate(_plugins):
+                    if isinstance(plugin, KeyframeWindow):
+                        logger.info(
+                            "Entering Keyframe editing mode. Patching KeyframeWindow with MSKeyframeWindow"
+                        )
+                        _plugins[i] = MSKeyframeWindow()
                 self._viewer = Viewer(self._renderer, plugins=_plugins)
                 self._setup_viewer()
-            self._viewer.render_keypoint()
+            self._viewer.render()
             return self._viewer
         elif mode == "rgb_array":
             images = []
