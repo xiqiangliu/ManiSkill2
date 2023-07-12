@@ -26,7 +26,7 @@ class MSKeyFrame(R.UIKeyframe):
         self._frame = frame
 
     def __repr__(self):
-        return f"Keyframe(scene, frame={self.frame})"
+        return f"Keyframe(scene, frame={self.frame()})"
 
 
 class MSDuration(R.UIDuration):
@@ -34,10 +34,11 @@ class MSDuration(R.UIDuration):
 
     DEFAULT_DEFINITION = "\n".join(
         [
-            "import sapien.core as sapien",
-            "import numpy as np\n",
+            "import numpy as np",
+            "import sapien.core as sapien\n",
+            "from mani_skill2.envs.sapien_env import BaseEnv\n",
             "class Reward:",
-            "    def __init__(self, env, scene: sapien.Scene):",
+            "    def __init__(self, env: BaseEnv, scene: sapien.Scene):",
             "        self.env = env",
             "        self.scene = scene\n",
             "    def compute(self):",
@@ -63,6 +64,9 @@ class MSDuration(R.UIDuration):
 
     def keyframe1(self):
         return self._keyframe1
+
+    def name(self):
+        return self._name
 
     def set_name(self, name):
         self._name = name
@@ -269,7 +273,7 @@ class MSKeyframeWindow(Plugin):
         self.keyframe_editor.add_duration(duration)
 
     def move_keyframe(self, frame: MSKeyFrame, time: MSKeyFrame):
-        frame.frame = time
+        frame.set_frame(time)
 
     def load_keyframe(self, frame: MSKeyFrame):
         s_env = frame.serialized_env

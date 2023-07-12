@@ -1,5 +1,3 @@
-import pickle
-
 import sapien.core as sapien
 from sapien.utils.viewer.serialization import SerializedScene as _SerializedScene
 
@@ -13,12 +11,11 @@ class SerializedEnv(_SerializedScene):
         self._sim_freq = env.sim_freq
         self._control_freq = env.control_freq
         self._agent_cfg = env._agent_cfg
-        self._camera_cfg = env._camera_cfg
-        self._render_camera_cfg = env._render_camera_cfg
+        self._camera_cfgs = env._camera_cfgs
+        self._render_camera_cfgs = env._render_camera_cfgs
 
         self._obs = env.get_obs()
-        self._env_info = env.get_info()
-        self._env_reward = env.get_reward()
+        self._extra_info = env.get_info(obs=self.obs)
 
         super().__init__(env._scene)
 
@@ -36,20 +33,16 @@ class SerializedEnv(_SerializedScene):
 
     @property
     def camera_cfg(self):
-        return self._camera_cfg
+        return self._camera_cfgs
 
     @property
     def render_camera_cfg(self):
-        return self._render_camera_cfg
+        return self._render_camera_cfgs
 
     @property
     def obs(self):
         return self._obs
 
     @property
-    def env_info(self):
-        return self._env_info
-
-    @property
-    def env_reward(self):
-        return self._env_reward
+    def extra_info(self):
+        return self._extra_info
