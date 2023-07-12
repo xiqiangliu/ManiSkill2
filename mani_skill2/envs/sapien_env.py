@@ -684,12 +684,13 @@ class BaseEnv(gym.Env):
             pass
 
         # Store env instance in MSKeyframeWindow for keyframe editing
+        # NOTE: import here to avoid circular import
         from mani_skill2.utils.visualization.keyframe_editor import MSKeyframeWindow
 
         for plugin in self._viewer.plugins:
             if isinstance(plugin, MSKeyframeWindow):
                 plugin.env = self
-            break
+                break
 
     def render(self, mode="human", **kwargs):
         self.update_render()
@@ -700,6 +701,7 @@ class BaseEnv(gym.Env):
             self._viewer.render()
             return self._viewer
         elif mode == "human_kf":
+            # NOTE: import here to avoid circular import
             from mani_skill2.utils.visualization.keyframe_editor import MSKeyframeWindow
 
             if self._viewer is None:
