@@ -7,7 +7,7 @@ import sapien.core as sapien
 from sapien.core import renderer as R
 from sapien.utils.viewer.plugin import Plugin
 
-from ..serialization import SerializedEnv
+from .serialization import SerializedEnv
 from mani_skill2.envs.sapien_env import BaseEnv
 
 
