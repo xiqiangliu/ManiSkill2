@@ -1,5 +1,4 @@
 import os
-import platform
 import tempfile
 from collections.abc import Iterable
 
@@ -7,8 +6,11 @@ import sapien.core as sapien
 from sapien.core import renderer as R
 from sapien.utils.viewer.plugin import Plugin
 
-from .serialization import SerializedEnv
 from mani_skill2.envs.sapien_env import BaseEnv
+from mani_skill2.utils.logging_utils import logger
+
+from ..editing.planner.mpc.cem import CEM
+from .serialization import SerializedEnv
 
 
 class MSKeyFrame(R.UIKeyframe):
@@ -160,6 +162,7 @@ class MSKeyframeWindow(Plugin):
         self.key_frame_envs = []
         self.edited_duration = None
         self._editor_file_name = None
+        self.optim_kwargs = None
 
         self.current_frame = 0
         self.total_frames = 32
@@ -181,6 +184,7 @@ class MSKeyframeWindow(Plugin):
         self.show_popup = True
         self.popup.get_children()[1].Value(self.edited_duration.name())
         self.popup.get_children()[2].Value(self.edited_duration.definition)
+        self.popup.get_children()[3].Value(self.optim_kwargs)
 
     def duration_name_change(self, text):
         self.edited_duration.set_name(text.value)
@@ -188,9 +192,13 @@ class MSKeyframeWindow(Plugin):
     def duration_definition_change(self, text):
         self.edited_duration.definition = text.value
 
+    def optim_kwargs_change(self, text):
+        self.optim_kwargs = text.value
+
     def confirm_popup(self, _):
         self.edited_duration.set_name(self.popup.get_children()[1].value)
         self.edited_duration.definition = self.popup.get_children()[2].value
+        self.optim_kwargs = self.popup.get_children()[3].value
         self.close_popup()
 
     def cancel_popup(self, _):
@@ -208,9 +216,9 @@ class MSKeyframeWindow(Plugin):
             editor_file.close()
             self._editor_file_name = editor_file.name
 
-        if platform.system() == "Linux":
+        if os.uname().sysname == "Linux":
             os.system("gedit '{}' & disown".format(self._editor_file_name))
-        elif platform.system() == "Windows":
+        elif os.uname().sysname == "Windows":
             print(f"Please open and edit the file {self._editor_file_name} manually")
 
     def notify_window_focus_change(self, focused):
@@ -241,6 +249,9 @@ class MSKeyframeWindow(Plugin):
                 R.UIInputTextMultiline()
                 .Label("Definition")
                 .Callback(self.duration_definition_change),
+                R.UIInputTextMultiline()
+                .Label("Optimizer Kwargs")
+                .Callback(self.optim_kwargs_change),
             )
         )
 
@@ -256,6 +267,7 @@ class MSKeyframeWindow(Plugin):
             .append(
                 R.UIButton().Label("Export").Callback(self.editor_export),
                 R.UIButton().Label("Import").Callback(self.editor_import),
+                R.UIButton().Label("Plan").Callback(self.plan_traj),
             )
         )
 
@@ -277,7 +289,7 @@ class MSKeyframeWindow(Plugin):
 
     def load_keyframe(self, frame: MSKeyFrame):
         s_env = frame.serialized_env
-        s_env.dump_state_into(self.env)
+        s_env.dump_state_into(self.scene)
 
     def edit_duration(self, duration):
         self.edited_duration = duration
@@ -311,3 +323,18 @@ class MSKeyframeWindow(Plugin):
 
     def editor_import(self, _):
         self.set_editor_state(self._state)
+
+    def plan_traj(self, _):
+        """Plan a trajectory using the serialized keyframes and durations in the editor"""
+        logger.info("Planning trajectory...")
+
+        _, _, (serialize_keyframes, serialized_durations) = self.get_editor_state()
+        self.optim_kwargs["env"] = self.env
+        optimizer = CEM(**self.optim_kwargs)
+
+        for kf1_id, kf2_id, name, duration in serialized_durations:
+            logger.info("Planning trajectory for duration %s", name)
+            kf1: MSKeyFrame = serialize_keyframes[kf1_id]
+            kf2: MSKeyFrame = serialize_keyframes[kf2_id]
+
+            optimizer.optimize(kf1, kf2)
