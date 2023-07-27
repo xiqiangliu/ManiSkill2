@@ -1,6 +1,6 @@
 FROM nvidia/cudagl:11.3.1-devel-ubuntu20.04
 ENV NVIDIA_DRIVER_CAPABILITIES all
-ARG PYTHON_VERSION=3.8
+ARG PYTHON_VERSION=3.10
 
 # Install os-level packages
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
