@@ -30,7 +30,7 @@ RUN curl -o ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest
     ~/miniconda.sh -b -p /opt/conda && \
     rm ~/miniconda.sh && \
     /opt/conda/bin/conda init && \
-    /opt/conda/bin/conda install -y python=3.8 && \
+    /opt/conda/bin/conda install -y python=3.10 && \
     /opt/conda/bin/conda clean -ya
 
 ENV PATH /opt/conda/bin:$PATH
@@ -40,4 +40,8 @@ SHELL ["/bin/bash", "-c"]
 COPY nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.json
 COPY nvidia_layers.json /etc/vulkan/implicit_layer.d/nvidia_layers.json
 
-RUN pip install mani-skill2==0.4.2 && pip cache purge
+RUN apt-get update && apt install -yqq x11vnc fluxbox && rm -rf /var/lib/apt/lists/*
+RUN pip install --upgrade setuptools==61.0
+
+ENTRYPOINT [ "bash", "-c" ]
+CMD [ "x11vnc -create -env FD_PROG=/usr/bin/fluxbox  -env X11VNC_FINDDISPLAY_ALWAYS_FAILS=1 -env X11VNC_CREATE_GEOM=${1:-1920x1080x16} -gone 'pkill Xvfb' -passwd 1234"]
