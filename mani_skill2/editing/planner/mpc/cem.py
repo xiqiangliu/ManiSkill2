@@ -1,8 +1,12 @@
-from typing import Callable, Optional, Sequence
+import multiprocessing as mp
+from typing import Optional
 
 import gym
 import numpy as np
 import sapien.core as sapien
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from tqdm import trange
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from mani_skill2.editing.keyframe_editor import MSDuration, MSKeyFrame
 from mani_skill2.editing.serialization import SerializedEnv
@@ -12,88 +16,14 @@ from mani_skill2.utils.logging_utils import logger
 from ..base import BasePlanner
 
 
-class CEMOptimizer:
-    """Cross Entropy Method Optimizer
+def _ms2_env_fn(env_id: str, idx: int):
+    def _env_fn():
+        env: BaseEnv = gym.make(env_id, obs_mode="none", control_mode="pd_ee_delta_pos")
+        env.reset(seed=idx)
 
-    Args:
-        population (int): population size
-        elite (int): elite size
-        n_iter(int): number of iteration per optimization step
-        lr (float): learning rate
-        bounds (Sequence): bounds of the action space
-        rng (np.random.Generator): random number generator
-    """
+        return env
 
-    def __init__(
-        self,
-        population: int,
-        elite: int,
-        eval_fn: Callable[[], tuple[np.ndarray, np.ndarray]],
-        n_iter: int = 10,
-        lr: float = 1.0,
-        bounds: Optional[Sequence] = None,
-        rng: Optional[np.random.Generator] = None,
-    ):
-        logger.info(
-            "Initializing CEM Optimizer: num_population=%s, "
-            "num_elite=%s, num_iter=%s",
-            population,
-            elite,
-            n_iter,
-        )
-
-        self.population = population
-        self.elite = elite
-        self.eval_fn = eval_fn
-        self.n_iter = n_iter
-        self.lr = lr
-        self._rng = rng if rng is not None else np.random.default_rng()
-
-        self.lb = np.float32(bounds[0]) if bounds[0] else -np.inf
-        self.ub = np.float32(bounds[1]) if bounds[1] else np.inf
-
-        self.mean = None
-        self.std = None
-
-    def reset(self, actions: np.ndarray):
-        """Reset the mean and std of the distribution.
-
-        Args:
-            actions (np.ndarray): the actions to be optimized
-        """
-
-        self.mean = np.zeros_like(actions)
-        self.std = np.ones_like(actions)
-
-    def optimize(self, state: SerializedEnv):
-        """Optimize the mean and std of the distribution.
-
-        Args:
-            state (SerializedEnv): the current state of the environment.
-                The state will be directly passed to the evaluation function.
-
-        Returns:
-            np.ndarray: elite action
-        """
-
-        x_shape = (self.population,) + self.mean.shape
-
-        for _ in range(self.n_iter):
-            samples = self._rng.normal(loc=self.mean, scale=self.std, size=x_shape)
-
-            reward = self.eval_fn(state, samples)
-            elite_idx = np.argsort(reward)[-self.elite :]
-            elite_samples = samples[elite_idx]
-
-            self.mean = (
-                self.mean * (1 - self.lr) + np.mean(elite_samples, axis=0) * self.lr
-            )
-            self.std = (
-                self.std**2 * (1 - self.lr)
-                + np.std(elite_samples, axis=0) ** 2 * self.lr
-            ) ** 0.5
-
-        return self.mean
+    return _env_fn
 
 
 class CEM(BasePlanner):
@@ -103,87 +33,135 @@ class CEM(BasePlanner):
         self,
         population: int,
         elite: int,
-        n_iter: int = 10,
+        sample_env: SerializedEnv,
+        horizon: int,
+        cem_iter: int = 10,
         lr: float = 1.0,
-        bounds: Optional[Sequence] = None,
+        use_history: bool = True,
+        num_wip_envs: int = mp.cpu_count(),
+        record_dir: Optional[str] = None,
         seed: Optional[int] = None,
         engine: Optional[sapien.Engine] = None,
     ):
-        super().__init__(seed=seed, engine=engine)
-
         self.population = population
         self.elite = elite
-        self.n_iter = n_iter
+        self.horizon = horizon
+        self.cem_iter = cem_iter
         self.lr = lr
-        self.bounds = bounds
+        self.use_history = use_history
+        self.num_wip_envs = num_wip_envs
 
-        self.reset()
+        super().__init__(
+            senv=sample_env, seed=seed, engine=engine, record_dir=record_dir
+        )
 
-    def reset(self):
-        self._wip_envs = []
+    def reset(self, senv: SerializedEnv):
+        super().reset(senv)
 
-    def duplicate_envs(self, senv: SerializedEnv, num_scenes: int) -> Sequence[BaseEnv]:
-        """Duplicate sapien.Scene for optimization purposes.
+        if hasattr(self, "_wip_envs") and isinstance(self._wip_envs, SubprocVecEnv):
+            self._wip_envs.close()
+        self._wip_envs = self._duplicate_envs(senv, self.num_wip_envs)
+
+        self.current_actions = None
+        self.step = 0
+
+        # Initial distribution
+        # NOTE: we only support environments with single controller for now
+        if self.action_space.is_bounded():
+            self.lb, self.ub = self.action_space.low, self.action_space.high
+        else:
+            self.lb, self.ub = -np.inf, np.inf
+
+        self.init_mean = ((self.lb + self.ub) * 0.5)[None, :].repeat(
+            self.horizon, axis=0
+        )
+        self.init_std = ((self.action_space.high - self.action_space.low) * 0.5)[
+            None, ...
+        ].repeat(self.horizon, axis=0)
+
+        self._odd_batch_warning = False
+
+    def close(self):
+        """Close the planner, along with all of its associated environments."""
+
+        self._wip_envs.close()
+        super().close()
+
+    def _duplicate_envs(
+        self,
+        senv: SerializedEnv,
+        num_envs: int,
+        spawn: bool = True,
+    ) -> SubprocVecEnv:
+        """Generate VecEnv for internal evaluation use.
 
         Args:
             senv (SerializedEnv): the serialized environment
             num_scenes (int): the number of scenes to be duplicated
+            spawn (bool, optional): whether to use spawn for vectorized environments. Defaults to True.
 
         Returns:
-            Sequence[BaseEnv]: the duplicated scenes
+            SubprocVecEnv: the vectorized environment
         """
 
-        self._wip_envs: list[BaseEnv] = [
-            gym.make(
-                senv.env_id, obs_mode="none", control_mode=senv.control_mode
-            ).unwrapped
-            for _ in range(num_scenes)
-        ]
+        env_fns = [_ms2_env_fn(senv.env_id, i) for i in range(num_envs)]
 
-        for env in self._wip_envs:
-            env.reset()
-            senv.dump_state_into(env._scene)
+        env = SubprocVecEnv(env_fns, start_method="spawn" if spawn else "fork")
+        env.reset()
+        env.env_method("set_state", senv.state)
 
-    def eval(self, senv: SerializedEnv, samples: np.ndarray):
+        return env
+
+    def _eval(self, state: np.ndarray, samples: np.ndarray):
         """Evaluate the samples and return the reward of the samples.
 
         Args:
-            senv (SerializedEnv): the serialized environment
-            samples (np.ndarray): the samples to be evaluated
+            state (np.ndarray): the state of the environment
+            samples (np.ndarray): the samples to be evaluated, has the shape (num_samples, horizon, action_dim)
 
         Returns:
-            np.ndarray: the reward of the samples
+            np.ndarray: the reward of the samples, has the shape (num_samples, horizon)
         """
 
-        rewards = np.zeros(samples.shape[0])
-        for i, env in enumerate(self._wip_envs):
-            senv.dump_state_into(env._scene)
-            _, rewards[i], _, _ = env.step(samples[i])
-            senv.dump_state_into(env._scene)  # reset the env back to its starting state
+        reward_per_step = np.zeros(shape=(self.population, self.horizon))
 
-        return rewards
+        if self.num_wip_envs != self.population:
+            num_iters = self.population // self.num_wip_envs
+            if self.population % self.num_wip_envs != 0:
+                num_iters += 1
 
-    def execute(self, state: SerializedEnv, action: np.ndarray) -> SerializedEnv:
-        """Execute an action on the duplicated scenes.
+                if not self._odd_batch_warning:
+                    logger.warning(
+                        "The population is not divisible by the number of envs."
+                        " Last batch will be padded."
+                    )
+                    self._odd_batch_warning = True
+        else:
+            num_iters = self.num_wip_envs
 
-        Args:
-            action (np.ndarray): the action to be executed
-        """
+        for i in range(num_iters):
+            self._wip_envs.reset()
+            self._wip_envs.env_method("set_state", state)
 
-        if not self._wip_envs:
-            raise RuntimeError(
-                "CEM planner requires duplicated scenes for optimization."
-            )
+            if self._wip_envs.num_envs != self.population:
+                _samples = samples[i * self.num_wip_envs : (i + 1) * self.num_wip_envs]
+                _sample_size = _samples.shape[0]
+                _samples = _samples.repeat(self.num_wip_envs, axis=0)[
+                    : self.num_wip_envs
+                ]
+            else:
+                _samples = samples
+                _sample_size = self.population
 
-        state.dump_state_into(self._wip_envs[0]._scene)
-        self._wip_envs[0].step(action)
-        state.update_state_from(self._wip_envs[0]._scene)
+            for j in range(self.horizon):
+                _, reward, _, info = self._wip_envs.step(_samples[:, j])
+                reward_per_step[
+                    i * self.num_wip_envs : (i + 1) * self.num_wip_envs, j
+                ] = reward[:_sample_size]
 
-        return state
+        return reward_per_step
 
-    def plan(
-        self, kf_1: MSKeyFrame, kf_2: MSKeyFrame, duration: MSDuration
-    ) -> SerializedEnv:
+    def plan(self, kf_1: MSKeyFrame, kf_2: MSKeyFrame, duration: MSDuration):
         """Plan a trajectory from keyframe to keyframe.
 
         Args:
@@ -191,31 +169,85 @@ class CEM(BasePlanner):
             kf_2 (MSKeyFrame): the second keyframe
         """
 
-        if not self._wip_envs:
-            raise RuntimeError(
-                "CEM planner requires duplicated scenes for optimization."
+        if not self._wip_envs or not self._eval_env:
+            raise RuntimeError("The planner has not been reset yet.")
+
+        allowed_frames = kf_2.frame() - kf_1.frame()
+
+        with logging_redirect_tqdm(loggers=[logger]):
+            logger.info("Planning %i frames between keyframes.", allowed_frames)
+
+            assert self.current_actions is None
+            self.current_actions = np.zeros(
+                shape=(allowed_frames, self.action_space.shape[0])
             )
 
-        frame_1, frame_2 = kf_1.frame(), kf_2.frame()
-        allowable_frames = frame_2 - frame_1
+            current_state = kf_1.serialized_env.state
+            for i in trange(allowed_frames):
+                self.step = i
+                optimized_action = self._optimize(
+                    current_state, self.init_mean, self.init_std
+                )
 
-        action_space = kf_1.serialized_env.action_space
-        if action_space != kf_2.serialized_env.action_space:
-            raise ValueError("The action space of the two keyframes are not the same.")
+                if not self.execute(optimized_action):
+                    logger.error("Failed to execute the optimized action.")
+                    break
 
-        optimizer = CEMOptimizer(
-            population=self.population,
-            elite=self.elite,
-            eval_fn=self.eval,
-            n_iter=self.n_iter,
-            lr=self.lr,
-            bounds=self.bounds,
-            rng=self._rng,
-        )
+                current_state = self._eval_env.get_state()
+                self.current_actions[i] = optimized_action
+            else:
+                return False
 
-        state = kf_1.serialized_env
-        for i in allowable_frames:
-            optimal_action = optimizer.optimize(state)
-            state = self.execute(state, optimal_action)
+        return True
 
-        return state
+    def _optimize(self, state: np.ndarray, init_mean: np.ndarray, init_std: np.ndarray):
+        """Optimize action given current state.
+
+        Args:
+            state (np.ndarray): current state
+            init_mean (np.ndarray): initial mean
+            init_std (np.ndarray): initial std
+
+        Returns:
+            np.ndarray: best action
+        """
+
+        history_elites = None
+
+        for _ in range(self.cem_iter):
+            ld = init_mean - self.lb
+            rd = self.ub - init_mean
+            _std = np.minimum(np.abs(np.minimum(ld, rd) / 2), init_std)
+            _mean = init_mean[None, ...].repeat(self.population, axis=0)
+            _std = _std[None, ...].repeat(self.population, axis=0)
+            samples = self._rng.normal(loc=_mean, scale=_std)
+
+            reward_per_step = self._eval(state, samples)
+            rewards = reward_per_step.mean(axis=-1)
+
+            # all_infos = samples, rewards, reward_per_step
+            # if history_elites is not None and self.use_history:
+            #     all_infos = [
+            #         np.concatenate([a, b], axis=0)
+            #         for a, b in zip(all_infos, history_elites)
+            #     ]
+            #     samples, rewards, reward_per_step = all_infos
+
+            valid_sign = rewards == rewards
+            rewards = rewards[valid_sign]
+            reward_per_step = reward_per_step[valid_sign]
+            samples = samples[valid_sign]
+
+            elite_idx = np.argsort(-rewards, axis=0)[: self.elite]
+            # if self.use_history:
+            #     history_elites = [a[elite_idx] for a in all_infos]
+
+            elites = samples[elite_idx]
+            elite_mean = elites.mean(axis=0)
+            elite_var = elites.var(axis=0)
+
+            _mean = _mean * (1 - self.lr) + elite_mean * self.lr
+            _std = (_std**2 * (1 - self.lr) + elite_var * self.lr) ** 0.5
+
+        assert len(elites) > 0
+        return elites[0, 0]  # First action of the elite action sequence
