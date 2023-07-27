@@ -9,7 +9,6 @@ from sapien.utils.viewer.plugin import Plugin
 from mani_skill2.envs.sapien_env import BaseEnv
 from mani_skill2.utils.logging_utils import logger
 
-from ..editing.planner.mpc.cem import CEM
 from .serialization import SerializedEnv
 
 
@@ -184,7 +183,6 @@ class MSKeyframeWindow(Plugin):
         self.show_popup = True
         self.popup.get_children()[1].Value(self.edited_duration.name())
         self.popup.get_children()[2].Value(self.edited_duration.definition)
-        self.popup.get_children()[3].Value(self.optim_kwargs)
 
     def duration_name_change(self, text):
         self.edited_duration.set_name(text.value)
@@ -193,7 +191,7 @@ class MSKeyframeWindow(Plugin):
         self.edited_duration.definition = text.value
 
     def optim_kwargs_change(self, text):
-        self.optim_kwargs = text.value
+        self.optim_kwargs = eval(text.value)
 
     def confirm_popup(self, _):
         self.edited_duration.set_name(self.popup.get_children()[1].value)
@@ -327,6 +325,9 @@ class MSKeyframeWindow(Plugin):
     def plan_traj(self, _):
         """Plan a trajectory using the serialized keyframes and durations in the editor"""
         logger.info("Planning trajectory...")
+
+        # avoid circular import
+        from ..editing.planner.mpc.cem import CEM
 
         _, _, (serialize_keyframes, serialized_durations) = self.get_editor_state()
         self.optim_kwargs["env"] = self.env
