@@ -4,6 +4,7 @@ from typing import Optional
 import gym
 import numpy as np
 import sapien.core as sapien
+from scipy.stats import truncnorm
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from tqdm import trange
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -16,9 +17,9 @@ from mani_skill2.utils.logging_utils import logger
 from ..base import BasePlanner
 
 
-def _ms2_env_fn(env_id: str, idx: int):
+def _ms2_env_fn(env_id: str, idx: int, obs_mode: str, control_mode: str):
     def _env_fn():
-        env: BaseEnv = gym.make(env_id, obs_mode="none", control_mode="pd_ee_delta_pos")
+        env: BaseEnv = gym.make(env_id, obs_mode=obs_mode, control_mode=control_mode)
         env.reset(seed=idx)
 
         return env
@@ -50,6 +51,7 @@ class CEM(BasePlanner):
         self.lr = lr
         self.use_history = use_history
         self.num_wip_envs = num_wip_envs
+        self._truncnorm = None
 
         super().__init__(
             senv=sample_env, seed=seed, engine=engine, record_dir=record_dir
@@ -69,14 +71,16 @@ class CEM(BasePlanner):
         # NOTE: we only support environments with single controller for now
         if self.action_space.is_bounded():
             self.lb, self.ub = self.action_space.low, self.action_space.high
+            self._use_truncnorm = True
         else:
             self.lb, self.ub = -np.inf, np.inf
+            self._use_truncnorm = False
 
         self.init_mean = ((self.lb + self.ub) * 0.5)[None, :].repeat(
             self.horizon, axis=0
         )
-        self.init_std = ((self.action_space.high - self.action_space.low) * 0.5)[
-            None, ...
+        self.init_std = ((self.action_space.high - self.action_space.low) * 0.25)[
+            None, :
         ].repeat(self.horizon, axis=0)
 
         self._odd_batch_warning = False
@@ -84,8 +88,8 @@ class CEM(BasePlanner):
     def close(self):
         """Close the planner, along with all of its associated environments."""
 
-        self._wip_envs.close()
         super().close()
+        self._wip_envs.close()
 
     def _duplicate_envs(
         self,
@@ -104,7 +108,15 @@ class CEM(BasePlanner):
             SubprocVecEnv: the vectorized environment
         """
 
-        env_fns = [_ms2_env_fn(senv.env_id, i) for i in range(num_envs)]
+        env_fns = [
+            _ms2_env_fn(
+                env_id=senv.env_id,
+                idx=i,
+                obs_mode=senv.obs_mode,
+                control_mode=senv.control_mode,
+            )
+            for i in range(num_envs)
+        ]
 
         env = SubprocVecEnv(env_fns, start_method="spawn" if spawn else "fork")
         env.reset()
@@ -200,13 +212,13 @@ class CEM(BasePlanner):
 
         return True
 
-    def _optimize(self, state: np.ndarray, init_mean: np.ndarray, init_std: np.ndarray):
+    def _optimize(self, state: np.ndarray, mean: np.ndarray, std: np.ndarray):
         """Optimize action given current state.
 
         Args:
             state (np.ndarray): current state
-            init_mean (np.ndarray): initial mean
-            init_std (np.ndarray): initial std
+            mean (np.ndarray): initial mean
+            std (np.ndarray): initial std
 
         Returns:
             np.ndarray: best action
@@ -215,39 +227,49 @@ class CEM(BasePlanner):
         history_elites = None
 
         for _ in range(self.cem_iter):
-            ld = init_mean - self.lb
-            rd = self.ub - init_mean
-            _std = np.minimum(np.abs(np.minimum(ld, rd) / 2), init_std)
-            _mean = init_mean[None, ...].repeat(self.population, axis=0)
-            _std = _std[None, ...].repeat(self.population, axis=0)
-            samples = self._rng.normal(loc=_mean, scale=_std)
+            ld = mean - self.lb
+            rd = self.ub - mean
 
+            _mean = mean[None, ...].repeat(self.population, axis=0)
+            _std = np.minimum(np.abs(np.minimum(ld, rd) / 2), std)[None, ...].repeat(
+                self.population, axis=0
+            )
+
+            if self._use_truncnorm:
+                samples = truncnorm.rvs(
+                    a=self.lb, b=self.ub, size=_mean.shape, random_state=self._rng
+                )
+            else:
+                samples = self._rng.normal(size=_mean.shape)
+            samples = _mean + _std * samples
             reward_per_step = self._eval(state, samples)
             rewards = reward_per_step.mean(axis=-1)
 
-            # all_infos = samples, rewards, reward_per_step
-            # if history_elites is not None and self.use_history:
-            #     all_infos = [
-            #         np.concatenate([a, b], axis=0)
-            #         for a, b in zip(all_infos, history_elites)
-            #     ]
-            #     samples, rewards, reward_per_step = all_infos
+            all_infos = samples, rewards, reward_per_step
+            if history_elites is not None and self.use_history:
+                all_infos = [
+                    np.concatenate([a, b], axis=0)
+                    for a, b in zip(all_infos, history_elites)
+                ]
+                samples, rewards, reward_per_step = all_infos
 
             valid_sign = rewards == rewards
             rewards = rewards[valid_sign]
             reward_per_step = reward_per_step[valid_sign]
             samples = samples[valid_sign]
 
-            elite_idx = np.argsort(-rewards, axis=0)[: self.elite]
-            # if self.use_history:
-            #     history_elites = [a[elite_idx] for a in all_infos]
+            # elite_idx = np.argpartition(rewards, self.elite, axis=0)[: self.elite]
+            elite_idx = np.argsort(rewards)[-self.elite :]
+            if self.use_history:
+                history_elites = [a[elite_idx] for a in all_infos]
 
             elites = samples[elite_idx]
             elite_mean = elites.mean(axis=0)
             elite_var = elites.var(axis=0)
 
-            _mean = _mean * (1 - self.lr) + elite_mean * self.lr
-            _std = (_std**2 * (1 - self.lr) + elite_var * self.lr) ** 0.5
+            mean = mean * (1 - self.lr) + elite_mean * self.lr
+            std = (std**2 * (1 - self.lr) + elite_var * self.lr) ** 0.5
+            logger.info("CEM Iter %i: Mean: %s, Std: %s", _, mean[0], std.max())
 
         assert len(elites) > 0
-        return elites[0, 0]  # First action of the elite action sequence
+        return samples[elite_idx[-1], 0]  # First action of the elite action sequence
