@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 from collections.abc import Iterable
 
@@ -123,9 +124,19 @@ def deserialize_keyframes(
 class MSKeyframeWindow(Plugin):
     """A keyframe editor plugin in SAPIEN for ManiSkill2"""
 
+    SUPPORTED_PLANNERS = ("CEM",)
+
     ui_window: R.UIWindow
-    popup: R.UIPopup
-    show_popup: bool
+
+    popup_duration: R.UIPopup
+    show_popup_duration: bool
+
+    popup_no_editor: R.UIPopup
+    show_popup_no_editor: bool
+
+    popup_planner_cfg: R.UIPopup
+    show_popup_planner_cfg: bool
+
     keyframe_editor: R.UIKeyframeEditor
     key_frame_envs: list[MSKeyFrame]
     edited_duration: MSDuration
@@ -133,7 +144,6 @@ class MSKeyframeWindow(Plugin):
 
     def __init__(self):
         self.reset()
-        self._env = None
 
     @property
     def scene(self):
@@ -155,22 +165,31 @@ class MSKeyframeWindow(Plugin):
 
     def reset(self):
         self.ui_window = None
-        self.popup = None
-        self.show_popup = False
+        self.popup_duration = None
+        self.show_popup_duration = False
+
+        self.popup_no_editor = None
+        self.show_popup_no_editor = False
+
+        self.popup_planner_cfg = None
+        self.show_popup_planner_cfg = False
+        self._backend = None
+        self._backend_cfg = None
+
         self.keyframe_editor = None
         self.key_frame_envs = []
         self.edited_duration = None
         self._editor_file_name = None
-        self.optim_kwargs = None
 
         self.current_frame = 0
         self.total_frames = 32
+        self._env = None
 
     def close(self):
         self.reset()
 
-    def close_popup(self):
-        self.show_popup = False
+    def close_popup_duration(self):
+        self.show_popup_duration = False
         if self._editor_file_name:
             try:
                 os.remove(self._editor_file_name)
@@ -179,10 +198,10 @@ class MSKeyframeWindow(Plugin):
 
         self._editor_file_name = None
 
-    def open_popup(self):
-        self.show_popup = True
-        self.popup.get_children()[1].Value(self.edited_duration.name())
-        self.popup.get_children()[2].Value(self.edited_duration.definition)
+    def open_popup_duration(self):
+        self.show_popup_duration = True
+        self.popup_duration.get_children()[1].Value(self.edited_duration.name())
+        self.popup_duration.get_children()[2].Value(self.edited_duration.definition)
 
     def duration_name_change(self, text):
         self.edited_duration.set_name(text.value)
@@ -190,19 +209,21 @@ class MSKeyframeWindow(Plugin):
     def duration_definition_change(self, text):
         self.edited_duration.definition = text.value
 
-    def optim_kwargs_change(self, text):
-        self.optim_kwargs = eval(text.value)
+    def confirm_popup_duration(self, _):
+        self.edited_duration.set_name(self.popup_duration.get_children()[1].value)
+        self.edited_duration.definition = self.popup_duration.get_children()[2].value
+        self.close_popup_duration()
 
-    def confirm_popup(self, _):
-        self.edited_duration.set_name(self.popup.get_children()[1].value)
-        self.edited_duration.definition = self.popup.get_children()[2].value
-        self.optim_kwargs = self.popup.get_children()[3].value
-        self.close_popup()
-
-    def cancel_popup(self, _):
-        self.close_popup()
+    def cancel_popup_duration(self, _):
+        self.close_popup_duration()
 
     def open_in_editor(self, _):
+        if shutil.which("gedit") is None:
+            # Cannot have more than one popup at a time
+            self.show_popup_duration = False
+            self.show_popup_no_editor = True
+            return
+
         if self._editor_file_name is None:
             editor_file = tempfile.NamedTemporaryFile(
                 mode="w+",
@@ -214,16 +235,73 @@ class MSKeyframeWindow(Plugin):
             editor_file.close()
             self._editor_file_name = editor_file.name
 
-        if os.uname().sysname == "Linux":
-            os.system("gedit '{}' & disown".format(self._editor_file_name))
-        elif os.uname().sysname == "Windows":
-            print(f"Please open and edit the file {self._editor_file_name} manually")
+        if os.system(f"gedit '{self._editor_file_name}' & disown") != 0:
+            # Cannot have more than one popup at a time
+            self.show_popup_duration = False
+            self.show_popup_no_editor = True
+
+    def close_popup_no_editor(self, _):
+        # need to revert popup due to one popup restriction
+        self.show_popup_no_editor = False
+        self.show_popup_duration = True
+
+    def open_popup_planner_cfg(self, _):
+        self.show_popup_planner_cfg = True
+        self.update_planner_cfg_display(_)
+
+    def confirm_popup_planner_cfg(self, _):
+        self.close_popup_duration()
+
+    def close_popup_planner_cfg(self, _):
+        self.show_popup_planner_cfg = False
+
+    def update_planner_cfg_display(self, _):
+        self._backend = self.popup_planner_cfg.get_children()[0].get_children()[1].value
+
+        section: R.UISection = self.popup_planner_cfg.get_children()[1]
+        section.remove_children()
+
+        # NOTE: Pre-filled with default values
+        if self._backend == "CEM":
+            from .planner.mpc import CEMConfig
+
+            if not isinstance(self._backend_cfg, CEMConfig):
+                self._backend_cfg = CEMConfig()
+
+            section.append(R.UIDisplayText().Text("CEM Configuration"))
+            section.append(
+                R.UISliderInt()
+                .Label("Iterations")
+                .Bind(self._backend_cfg, "cem_iter")
+                .Min(1)
+                .Max(10),
+                R.UIInputInt()
+                .Label("Population")
+                .Bind(self._backend_cfg, "population"),
+                R.UIInputInt().Label("Elite").Bind(self._backend_cfg, "elite"),
+                R.UIInputInt().Label("Horizon").Bind(self._backend_cfg, "horizon"),
+                R.UISliderFloat()
+                .Label("Learning Rate")
+                .Bind(self._backend_cfg, "lr")
+                .Min(0.0)
+                .Max(2.0),
+                R.UIInputInt()
+                .Label("# of Rollout Environments")
+                .Bind(self._backend_cfg, "num_wip_envs"),
+                R.UIInputInt()
+                .Label("Seed (-1 for No Seed)")
+                .Bind(self._backend_cfg, "seed_ui"),
+            )
+        else:
+            logger.error("Unsupported planner backend: %s", self._backend_cfg["type"])
 
     def notify_window_focus_change(self, focused):
         if focused and self.edited_duration and self._editor_file_name:
             with open(self._editor_file_name, "r") as f:
                 self.edited_duration.definition = f.read()
-                self.popup.get_children()[2].Value(self.edited_duration.definition)
+                self.popup_duration.get_children()[2].Value(
+                    self.edited_duration.definition
+                )
 
     def build(self):
         if self.scene is None:
@@ -233,23 +311,58 @@ class MSKeyframeWindow(Plugin):
         if self.ui_window:
             return
 
-        self.popup = (
+        self.popup_duration = (
             R.UIPopup()
             .Label("Edit Duration")
-            .EscCallback(self.close_popup)
+            .EscCallback(self.close_popup_duration)
             .append(
                 R.UISameLine().append(
-                    R.UIButton().Label("Confirm").Callback(self.confirm_popup),
-                    R.UIButton().Label("Cancel").Callback(self.cancel_popup),
+                    R.UIButton().Label("Confirm").Callback(self.confirm_popup_duration),
+                    R.UIButton().Label("Cancel").Callback(self.cancel_popup_duration),
                     R.UIButton().Label("Open in Editor").Callback(self.open_in_editor),
                 ),
                 R.UIInputText().Label("Name").Callback(self.duration_name_change),
                 R.UIInputTextMultiline()
                 .Label("Definition")
                 .Callback(self.duration_definition_change),
-                R.UIInputTextMultiline()
-                .Label("Optimizer Kwargs")
-                .Callback(self.optim_kwargs_change),
+            )
+        )
+
+        self.popup_no_editor = (
+            R.UIPopup()
+            .Label("Unsupported Operation")
+            .append(
+                R.UIDisplayText().Text(
+                    "Cannot open gedit. Please edit everything in build-in editor instead."
+                ),
+                R.UIButton().Label("OK").Callback(self.close_popup_no_editor),
+            )
+        )
+
+        self.popup_planner_cfg = (
+            R.UIPopup()
+            .Label("Planner Configuration")
+            .append(
+                R.UISection()
+                .Label("Planner Selection")
+                .append(
+                    R.UIDisplayText().Text(
+                        "NOTE: Changing planner type will discard all settings with it."
+                    ),
+                    R.UIOptions()
+                    .Label("Type")
+                    .Style("select")
+                    .Id("backend")
+                    .Items(self.SUPPORTED_PLANNERS)
+                    .Callback(self.update_planner_cfg_display),
+                ),
+                R.UISection().Label("Planner Configuration"),
+                R.UISameLine().append(
+                    R.UIButton()
+                    .Label("Confirm")
+                    .Callback(self.confirm_popup_planner_cfg),
+                    R.UIButton().Label("Cancel").Callback(self.close_popup_planner_cfg),
+                ),
             )
         )
 
@@ -266,6 +379,9 @@ class MSKeyframeWindow(Plugin):
                 R.UIButton().Label("Export").Callback(self.editor_export),
                 R.UIButton().Label("Import").Callback(self.editor_import),
                 R.UIButton().Label("Plan").Callback(self.plan_traj),
+                R.UIButton()
+                .Label("Planner Configuration")
+                .Callback(self.open_popup_planner_cfg),
             )
         )
 
@@ -291,15 +407,19 @@ class MSKeyframeWindow(Plugin):
 
     def edit_duration(self, duration):
         self.edited_duration = duration
-        self.open_popup()
+        self.open_popup_duration()
 
     def get_ui_windows(self):
         self.build()
         windows = []
         if self.ui_window:
             windows.append(self.ui_window)
-        if self.show_popup:
-            windows.append(self.popup)
+        if self.show_popup_duration:
+            windows.append(self.popup_duration)
+        if self.show_popup_no_editor:
+            windows.append(self.popup_no_editor)
+        if self.show_popup_planner_cfg:
+            windows.append(self.popup_planner_cfg)
         return windows
 
     def get_editor_state(self):
@@ -328,14 +448,3 @@ class MSKeyframeWindow(Plugin):
 
         # avoid circular import
         from ..editing.planner.mpc.cem import CEM
-
-        _, _, (serialize_keyframes, serialized_durations) = self.get_editor_state()
-        self.optim_kwargs["env"] = self.env
-        optimizer = CEM(**self.optim_kwargs)
-
-        for kf1_id, kf2_id, name, duration in serialized_durations:
-            logger.info("Planning trajectory for duration %s", name)
-            kf1: MSKeyFrame = serialize_keyframes[kf1_id]
-            kf2: MSKeyFrame = serialize_keyframes[kf2_id]
-
-            optimizer.optimize(kf1, kf2)

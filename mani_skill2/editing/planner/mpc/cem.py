@@ -1,4 +1,5 @@
 import multiprocessing as mp
+from types import SimpleNamespace
 from typing import Optional
 
 import gym
@@ -21,6 +22,32 @@ def _ms2_env_fn(env_id: str, idx: int, obs_mode: str, control_mode: str):
         return gym.make(env_id, obs_mode=obs_mode, control_mode=control_mode)
 
     return _env_fn
+
+
+class CEMConfig(SimpleNamespace):
+    def __init__(self, **kwargs):
+        self.population = 200
+        self.elite = 20
+        self.sample_env = None
+        self.horizon = 30
+        self.cem_iter = 4
+        self.lr = 1.0
+        self.use_history = True
+        self.num_wip_envs = mp.cpu_count()
+        self.record_dir = None
+        self.seed = None
+        self.engine = None
+
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    @property
+    def seed_ui(self):
+        return self.seed if self.seed is not None else -1
+
+    @seed_ui.setter
+    def seed_ui(self, v: int):
+        self.seed = v if v >= 0 else None
 
 
 class CEM(BasePlanner):
