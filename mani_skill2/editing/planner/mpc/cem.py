@@ -6,12 +6,11 @@ import numpy as np
 import sapien.core as sapien
 from scipy.stats import truncnorm
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from tqdm import trange
+from tqdm.auto import trange
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from mani_skill2.editing.keyframe_editor import MSDuration, MSKeyFrame
 from mani_skill2.editing.serialization import SerializedEnv
-from mani_skill2.envs.sapien_env import BaseEnv
 from mani_skill2.utils.logging_utils import logger
 
 from ..base import BasePlanner
@@ -19,10 +18,7 @@ from ..base import BasePlanner
 
 def _ms2_env_fn(env_id: str, idx: int, obs_mode: str, control_mode: str):
     def _env_fn():
-        env: BaseEnv = gym.make(env_id, obs_mode=obs_mode, control_mode=control_mode)
-        env.reset(seed=idx)
-
-        return env
+        return gym.make(env_id, obs_mode=obs_mode, control_mode=control_mode)
 
     return _env_fn
 
@@ -120,6 +116,7 @@ class CEM(BasePlanner):
 
         env = SubprocVecEnv(env_fns, start_method="spawn" if spawn else "fork")
         env.reset()
+        env.seed(self._seed)
         env.env_method("set_state", senv.state)
 
         return env
@@ -157,19 +154,14 @@ class CEM(BasePlanner):
 
             if self._wip_envs.num_envs != self.population:
                 _samples = samples[i * self.num_wip_envs : (i + 1) * self.num_wip_envs]
-                _sample_size = _samples.shape[0]
-                _samples = _samples.repeat(self.num_wip_envs, axis=0)[
-                    : self.num_wip_envs
-                ]
             else:
                 _samples = samples
-                _sample_size = self.population
 
             for j in range(self.horizon):
-                _, reward, _, info = self._wip_envs.step(_samples[:, j])
+                _, reward, _, _ = self._wip_envs.step(_samples[:, j])
                 reward_per_step[
                     i * self.num_wip_envs : (i + 1) * self.num_wip_envs, j
-                ] = reward[:_sample_size]
+                ] = reward[: _samples.shape[0]]
 
         return reward_per_step
 
@@ -195,11 +187,16 @@ class CEM(BasePlanner):
             )
 
             current_state = kf_1.serialized_env.state
-            for i in trange(allowed_frames):
+            for i in trange(allowed_frames, dynamic_ncols=True):
                 self.step = i
-                optimized_action = self._optimize(
-                    current_state, self.init_mean, self.init_std
-                )
+
+                with np.printoptions(precision=3, suppress=True):
+                    optimized_action = self._optimize(
+                        current_state, self.init_mean, self.init_std
+                    )
+                    logger.info(
+                        "Final action at step %i: %s", self.step, optimized_action
+                    )
 
                 if not self.execute(optimized_action):
                     logger.error("Failed to execute the optimized action.")
@@ -225,22 +222,20 @@ class CEM(BasePlanner):
         """
 
         history_elites = None
+        x_shape = (self.population,) + mean.shape
 
         for _ in range(self.cem_iter):
             ld = mean - self.lb
             rd = self.ub - mean
 
-            _mean = mean[None, ...].repeat(self.population, axis=0)
-            _std = np.minimum(np.abs(np.minimum(ld, rd) / 2), std)[None, ...].repeat(
-                self.population, axis=0
-            )
+            _mean = mean
+            _std = np.minimum(np.abs(np.minimum(ld, rd) / 2), std)
 
+            # NOTE: We only sample within 3 standard deviations if action space is bounded
             if self._use_truncnorm:
-                samples = truncnorm.rvs(
-                    a=self.lb, b=self.ub, size=_mean.shape, random_state=self._rng
-                )
+                samples = truncnorm.rvs(a=-3, b=3, size=x_shape, random_state=self._rng)
             else:
-                samples = self._rng.normal(size=_mean.shape)
+                samples = self._rng.normal(size=x_shape)
             samples = _mean + _std * samples
             reward_per_step = self._eval(state, samples)
             rewards = reward_per_step.mean(axis=-1)
@@ -258,8 +253,7 @@ class CEM(BasePlanner):
             reward_per_step = reward_per_step[valid_sign]
             samples = samples[valid_sign]
 
-            # elite_idx = np.argpartition(rewards, self.elite, axis=0)[: self.elite]
-            elite_idx = np.argsort(rewards)[-self.elite :]
+            elite_idx = np.argpartition(-rewards, self.elite, axis=0)[: self.elite]
             if self.use_history:
                 history_elites = [a[elite_idx] for a in all_infos]
 
@@ -269,7 +263,8 @@ class CEM(BasePlanner):
 
             mean = mean * (1 - self.lr) + elite_mean * self.lr
             std = (std**2 * (1 - self.lr) + elite_var * self.lr) ** 0.5
-            logger.info("CEM Iter %i: Mean: %s, Std: %s", _, mean[0], std.max())
+            with np.printoptions(precision=3, suppress=True):
+                logger.info("CEM Iter %i: Mean: %s, Std: %.3f", _, mean[0], std.max())
 
         assert len(elites) > 0
-        return samples[elite_idx[-1], 0]  # First action of the elite action sequence
+        return elite_mean[0]  # First action of the elite action sequence

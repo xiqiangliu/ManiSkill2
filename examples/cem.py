@@ -18,7 +18,7 @@ class KF:
 # For debug purposes
 if __name__ == "__main__":
     env: BaseEnv = gym.make(
-        "LiftCube-v0", obs_mode="none", control_mode="pd_ee_delta_pose"
+        "PickCube-v0", obs_mode="none", control_mode="pd_joint_delta_pos"
     )
     env.reset()
     senv = SerializedEnv(env)
@@ -28,8 +28,8 @@ if __name__ == "__main__":
         population=200,
         elite=20,
         sample_env=senv,
-        horizon=30,
-        cem_iter=4,
+        horizon=20,
+        cem_iter=5,
         num_wip_envs=10,
         seed=1234,
         lr=0.9,
@@ -38,10 +38,11 @@ if __name__ == "__main__":
     )
 
     kf_1 = KF(senv, 0)
-    kf_2 = KF(senv, 100)
+    kf_2 = KF(senv, 200)
 
     try:
         planner.plan(kf_1, kf_2, None)
-        raise KeyboardInterrupt
     except KeyboardInterrupt:
+        planner.close()
+    finally:
         planner.close()

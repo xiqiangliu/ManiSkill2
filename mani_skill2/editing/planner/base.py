@@ -46,6 +46,7 @@ class BasePlanner:
 
         self.closed = False
 
+        self._seed = self._rng.integers(0, 2**32 - 1)
         self._eval_env = gym.make(
             senv.env_id, obs_mode=senv.obs_mode, control_mode=senv.control_mode
         )
@@ -53,12 +54,18 @@ class BasePlanner:
             self._eval_env = RecordEpisode(
                 self._eval_env, self.record_dir, save_on_reset=False
             )
-        self._eval_env.reset()
+        self._eval_env.reset(seed=self._seed)
         self._eval_env.set_state(senv.state)
         self.cumulative_eval_reward = 0
 
         assert isinstance(senv.action_space, gym.Space)
         self.action_space = senv.action_space
+
+        logger.info(
+            "Resetted %s planner with evaluation environment seeded at %i",
+            self.__class__.__name__,
+            self._seed,
+        )
 
     def close(self):
         """Close and clean-up the planner."""
