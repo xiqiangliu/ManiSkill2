@@ -1,3 +1,5 @@
+import ast
+import copy
 import os
 import shutil
 import tempfile
@@ -10,6 +12,7 @@ from sapien.utils.viewer.plugin import Plugin
 from mani_skill2.envs.sapien_env import BaseEnv
 from mani_skill2.utils.logging_utils import logger
 
+from .reward import SUPPORTED_REWARD_TEMPLATES
 from .serialization import SerializedEnv
 
 
@@ -34,32 +37,19 @@ class MSKeyFrame(R.UIKeyframe):
 class MSDuration(R.UIDuration):
     """ManiSkill2-compatible Duration Implementation"""
 
-    DEFAULT_DEFINITION = "\n".join(
-        [
-            "import numpy as np",
-            "import sapien.core as sapien\n",
-            "from mani_skill2.envs.sapien_env import BaseEnv\n",
-            "class Reward:",
-            "    def __init__(self, env: BaseEnv, scene: sapien.Scene):",
-            "        self.env = env",
-            "        self.scene = scene\n",
-            "    def compute(self):",
-            "        return 0",
-        ]
-    )
-
     def __init__(
         self,
         keyframe0: MSKeyFrame,
         keyframe1: MSKeyFrame,
         name: str = "",
-        definition: str = DEFAULT_DEFINITION,
     ):
         super().__init__()
         self._keyframe0 = keyframe0
         self._keyframe1 = keyframe1
         self._name = name
-        self.definition = definition
+
+        self.definition = ""
+        self.reward = None
 
     def keyframe0(self):
         return self._keyframe0
@@ -175,6 +165,7 @@ class MSKeyframeWindow(Plugin):
         self.show_popup_planner_cfg = False
         self._backend = None
         self._backend_cfg = None
+        self._backend_cfg_tmp = None
 
         self.keyframe_editor = None
         self.key_frame_envs = []
@@ -200,19 +191,67 @@ class MSKeyframeWindow(Plugin):
 
     def open_popup_duration(self):
         self.show_popup_duration = True
-        self.popup_duration.get_children()[1].Value(self.edited_duration.name())
-        self.popup_duration.get_children()[2].Value(self.edited_duration.definition)
+        self.popup_duration.get_children()[2].Value(self.edited_duration.name())
+        self.duration_definition_overwrite(None)
 
     def duration_name_change(self, text):
         self.edited_duration.set_name(text.value)
+
+    def duration_definition_overwrite(self, _):
+        # HACK: Just calling box.Value(...) is not enough because while the part of the
+        # old string that's longer than the new string will not be overwritten.
+        self.popup_duration.get_children()[3].remove()
+        self.popup_duration.append(
+            R.UIInputTextMultiline()
+            .Label("Definition")
+            .Callback(self.duration_definition_change)
+            .Value(
+                SUPPORTED_REWARD_TEMPLATES[self.popup_duration.get_children()[1].value]
+            )
+        )
 
     def duration_definition_change(self, text):
         self.edited_duration.definition = text.value
 
     def confirm_popup_duration(self, _):
-        self.edited_duration.set_name(self.popup_duration.get_children()[1].value)
-        self.edited_duration.definition = self.popup_duration.get_children()[2].value
+        self.edited_duration.set_name(self.popup_duration.get_children()[2].value)
+        self.edited_duration.definition = self.popup_duration.get_children()[3].value
+
+        self.edited_duration.reward = self._parse_definition(
+            self.edited_duration.definition
+        )
         self.close_popup_duration()
+
+    def _parse_definition(self, definition: str):
+        definition_ast = ast.parse(definition)
+
+        # check if definition contains template class
+        for node in definition_ast.body:
+            if isinstance(node, ast.ClassDef):
+                if node.name == "Reward":
+                    reward_class = node
+                    break
+        else:
+            logger.warning("Invalid reward definition! Does not contain Reward class.")
+            return None
+
+        # check if definition contains compute method
+        for node in reward_class.body:
+            if isinstance(node, ast.FunctionDef):
+                if node.name == "compute":
+                    break
+        else:
+            logger.warning(
+                "Invalid reward definition! Does not contain compute method."
+            )
+            return None
+
+        definition_ast.body += ast.parse(
+            "reward_obj = Reward(scene = scene, env = env)"
+        ).body
+        scope = {"scene": self.scene, "env": self.env}
+        exec(compile(definition_ast, "<string>", "exec"), scope)
+        return scope["reward_obj"]
 
     def cancel_popup_duration(self, _):
         self.close_popup_duration()
@@ -250,50 +289,54 @@ class MSKeyframeWindow(Plugin):
         self.update_planner_cfg_display(_)
 
     def confirm_popup_planner_cfg(self, _):
-        self.close_popup_duration()
+        self._backend = self.popup_planner_cfg.get_children()[0].get_children()[1].value
+        self._backend_cfg = copy.deepcopy(self._backend_cfg_tmp)
+        self.close_popup_planner_cfg(_)
 
     def close_popup_planner_cfg(self, _):
         self.show_popup_planner_cfg = False
 
     def update_planner_cfg_display(self, _):
-        self._backend = self.popup_planner_cfg.get_children()[0].get_children()[1].value
+        backend = self.popup_planner_cfg.get_children()[0].get_children()[1].value
 
         section: R.UISection = self.popup_planner_cfg.get_children()[1]
         section.remove_children()
 
         # NOTE: Pre-filled with default values
-        if self._backend == "CEM":
+        if backend == "CEM":
             from .planner.mpc import CEMConfig
 
             if not isinstance(self._backend_cfg, CEMConfig):
-                self._backend_cfg = CEMConfig()
+                self._backend_cfg_tmp = CEMConfig()
+            else:
+                self._backend_cfg_tmp = copy.deepcopy(self._backend_cfg)
 
             section.append(R.UIDisplayText().Text("CEM Configuration"))
             section.append(
                 R.UISliderInt()
                 .Label("Iterations")
-                .Bind(self._backend_cfg, "cem_iter")
+                .Bind(self._backend_cfg_tmp, "cem_iter")
                 .Min(1)
                 .Max(10),
                 R.UIInputInt()
                 .Label("Population")
-                .Bind(self._backend_cfg, "population"),
-                R.UIInputInt().Label("Elite").Bind(self._backend_cfg, "elite"),
-                R.UIInputInt().Label("Horizon").Bind(self._backend_cfg, "horizon"),
+                .Bind(self._backend_cfg_tmp, "population"),
+                R.UIInputInt().Label("Elite").Bind(self._backend_cfg_tmp, "elite"),
+                R.UIInputInt().Label("Horizon").Bind(self._backend_cfg_tmp, "horizon"),
                 R.UISliderFloat()
                 .Label("Learning Rate")
-                .Bind(self._backend_cfg, "lr")
+                .Bind(self._backend_cfg_tmp, "lr")
                 .Min(0.0)
                 .Max(2.0),
                 R.UIInputInt()
                 .Label("# of Rollout Environments")
-                .Bind(self._backend_cfg, "num_wip_envs"),
+                .Bind(self._backend_cfg_tmp, "num_wip_envs"),
                 R.UIInputInt()
                 .Label("Seed (-1 for No Seed)")
-                .Bind(self._backend_cfg, "seed_ui"),
+                .Bind(self._backend_cfg_tmp, "seed_ui"),
             )
         else:
-            logger.error("Unsupported planner backend: %s", self._backend_cfg["type"])
+            logger.error("Unsupported planner backend: %s", backend)
 
     def notify_window_focus_change(self, focused):
         if focused and self.edited_duration and self._editor_file_name:
@@ -321,6 +364,11 @@ class MSKeyframeWindow(Plugin):
                     R.UIButton().Label("Cancel").Callback(self.cancel_popup_duration),
                     R.UIButton().Label("Open in Editor").Callback(self.open_in_editor),
                 ),
+                R.UIOptions()
+                .Label("Reward Template")
+                .Items(list(SUPPORTED_REWARD_TEMPLATES.keys()))
+                .Style("select")
+                .Callback(self.duration_definition_overwrite),
                 R.UIInputText().Label("Name").Callback(self.duration_name_change),
                 R.UIInputTextMultiline()
                 .Label("Definition")
@@ -444,7 +492,26 @@ class MSKeyframeWindow(Plugin):
 
     def plan_traj(self, _):
         """Plan a trajectory using the serialized keyframes and durations in the editor"""
-        logger.info("Planning trajectory...")
 
-        # avoid circular import
-        from ..editing.planner.mpc.cem import CEM
+        if self._backend is None:
+            self.open_popup_planner_cfg(_)
+            logger.warning(
+                "No planner backend has been configured. Please configure it first!"
+            )
+            return
+
+        logger.info("Planning trajectory with %s backend.", self._backend)
+        _, _, (serialize_keyframes, serialized_durations) = self.get_editor_state()
+        serialize_keyframes
+        if self._backend == "CEM":
+            # avoid circular import
+            from ..editing.planner.mpc.cem import CEM
+
+            for kf1_id, kf2_id, name, duration in serialized_durations:
+                senv_1 = serialize_keyframes[kf1_id][0]
+                senv_2 = serialize_keyframes[kf2_id][0]
+
+                cfg = copy.deepcopy(self._backend_cfg)
+                cfg.sample_env = senv_1
+                planner = CEM(**cfg.to_dict())
+                traj = planner.plan(senv_1, senv_2, duration)
