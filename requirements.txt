@@ -19,3 +19,6 @@ imageio
 imageio[ffmpeg]
 trimesh
 rtree
+
+# editing interface
+stable-baselines3==1.8.0

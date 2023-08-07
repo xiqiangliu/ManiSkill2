@@ -41,6 +41,13 @@ class CEMConfig(SimpleNamespace):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
+    def to_dict(self):
+        return {
+            k: v
+            for k, v in self.__dict__.items()
+            if not k.startswith("_") or callable(k)
+        }
+
     @property
     def seed_ui(self):
         return self.seed if self.seed is not None else -1
