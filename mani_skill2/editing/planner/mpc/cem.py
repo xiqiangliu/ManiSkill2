@@ -112,6 +112,28 @@ class CEM(BasePlanner):
         """Close the planner, along with all of its associated environments."""
 
         super().close()
+        logger.info("Gracefully shutdown rollout envs. Timeout = 10s")
+
+        try:
+            self._wip_envs.call_wait(timeout=10)
+        except gym.error.NoAsyncCallError:
+            pass
+        except mp.TimeoutError:
+            logger.warning(
+                "Timeout when gracefully closing rollout envs. Force closing now!"
+            )
+            self._wip_envs.close()
+            return
+
+        try:
+            self._wip_envs.step_wait(timeout=10)
+        except gym.error.NoAsyncCallError:
+            pass
+        except mp.TimeoutError:
+            logger.warning(
+                "Timeout when gracefully closing rollout envs. Force closing now!"
+            )
+
         self._wip_envs.close()
 
     def _duplicate_envs(
