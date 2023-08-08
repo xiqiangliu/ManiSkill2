@@ -79,7 +79,9 @@ def main():
         if not args.enable_sapien_viewer:
             return
         while True:
-            sapien_viewer = env.viewer
+            sapien_viewer = (
+                env.render_kf() if args.keyframe_editor else env.render_human()
+            )
             if sapien_viewer.window.key_down("0"):
                 break
 
