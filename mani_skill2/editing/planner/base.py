@@ -1,7 +1,7 @@
 import os
 from typing import Optional, Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 import sapien.core as sapien
 
@@ -46,9 +46,12 @@ class BasePlanner:
 
         self.closed = False
 
-        self._seed = self._rng.integers(0, 2**32 - 1)
+        self._seed = int(self._rng.integers(0, 2**32 - 1))
         self._eval_env = gym.make(
-            senv.env_id, obs_mode=senv.obs_mode, control_mode=senv.control_mode
+            senv.env_id,
+            obs_mode=senv.obs_mode,
+            control_mode=senv.control_mode,
+            render_mode="rgb_array",
         )
         if self.record_dir is not None:
             self._eval_env = RecordEpisode(
@@ -87,14 +90,16 @@ class BasePlanner:
         """
 
         assert self._eval_env
-        _, reward, _, info = self._eval_env.step(action)
+        _, reward, terminated, truncated, info = self._eval_env.step(action)
 
         self.cumulative_eval_reward += reward
         logger.info(
-            "Step %i: step_reward=%f, cum_reward=%f, env_info=%s",
+            "Step %i: step_reward=%f, cum_reward=%f, terminated=%s, truncated=%s, env_info=%s",
             self.step,
             reward,
             self.cumulative_eval_reward,
+            terminated,
+            truncated,
             info,
         )
 

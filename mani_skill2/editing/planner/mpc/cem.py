@@ -2,10 +2,11 @@ import multiprocessing as mp
 from types import SimpleNamespace
 from typing import Optional
 
-import gym
+import gymnasium as gym
 import numpy as np
 import sapien.core as sapien
 from scipy.stats import truncnorm
+from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from tqdm.auto import trange
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -15,13 +16,6 @@ from mani_skill2.editing.serialization import SerializedEnv
 from mani_skill2.utils.logging_utils import logger
 
 from ..base import BasePlanner
-
-
-def _ms2_env_fn(env_id: str, idx: int, obs_mode: str, control_mode: str):
-    def _env_fn():
-        return gym.make(env_id, obs_mode=obs_mode, control_mode=control_mode)
-
-    return _env_fn
 
 
 class CEMConfig(SimpleNamespace):
@@ -138,17 +132,16 @@ class CEM(BasePlanner):
             SubprocVecEnv: the vectorized environment
         """
 
-        env_fns = [
-            _ms2_env_fn(
-                env_id=senv.env_id,
-                idx=i,
-                obs_mode=senv.obs_mode,
-                control_mode=senv.control_mode,
-            )
-            for i in range(num_envs)
-        ]
-
-        env = SubprocVecEnv(env_fns, start_method="spawn" if spawn else "fork")
+        env = make_vec_env(
+            senv.env_id,
+            n_envs=num_envs,
+            seed=self._seed,
+            vec_env_cls=SubprocVecEnv,
+            env_kwargs={
+                "obs_mode": senv.obs_mode,
+                "control_mode": senv.control_mode,
+            },
+        )
         env.reset()
         env.seed(self._seed)
         env.env_method("set_state", senv.state)

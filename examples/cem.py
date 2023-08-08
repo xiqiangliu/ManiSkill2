@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 
 import mani_skill2.envs
 from mani_skill2.editing.serialization import SerializedEnv
@@ -18,7 +18,10 @@ class KF:
 # For debug purposes
 if __name__ == "__main__":
     env: BaseEnv = gym.make(
-        "PickCube-v0", obs_mode="none", control_mode="pd_joint_delta_pos"
+        "PickCube-v0",
+        obs_mode="state",
+        control_mode="pd_joint_delta_pos",
+        render_mode="rgb_array",
     )
     env.reset()
     senv = SerializedEnv(env)
