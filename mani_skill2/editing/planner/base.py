@@ -59,7 +59,9 @@ class BasePlanner:
             )
         self._eval_env.reset(seed=self._seed)
         self._eval_env.set_state(senv.state)
+
         self.cumulative_eval_reward = 0
+        self.step = 0
 
         assert isinstance(senv.action_space, gym.Space)
         self.action_space = senv.action_space

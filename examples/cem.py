@@ -45,7 +45,5 @@ if __name__ == "__main__":
 
     try:
         planner.plan(kf_1, kf_2, None)
-    except KeyboardInterrupt:
-        planner.close()
     finally:
         planner.close()

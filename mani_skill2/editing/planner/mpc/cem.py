@@ -6,8 +6,6 @@ import gymnasium as gym
 import numpy as np
 import sapien.core as sapien
 from scipy.stats import truncnorm
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
 from tqdm.auto import trange
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -84,12 +82,13 @@ class CEM(BasePlanner):
     def reset(self, senv: SerializedEnv):
         super().reset(senv)
 
-        if hasattr(self, "_wip_envs") and isinstance(self._wip_envs, SubprocVecEnv):
+        if hasattr(self, "_wip_envs") and isinstance(
+            self._wip_envs, gym.vector.AsyncVectorEnv
+        ):
             self._wip_envs.close()
         self._wip_envs = self._duplicate_envs(senv, self.num_wip_envs)
 
         self.current_actions = None
-        self.step = 0
 
         # Initial distribution
         # NOTE: we only support environments with single controller for now
@@ -120,7 +119,7 @@ class CEM(BasePlanner):
         senv: SerializedEnv,
         num_envs: int,
         spawn: bool = True,
-    ) -> SubprocVecEnv:
+    ) -> gym.vector.AsyncVectorEnv:
         """Generate VecEnv for internal evaluation use.
 
         Args:
@@ -129,22 +128,14 @@ class CEM(BasePlanner):
             spawn (bool, optional): whether to use spawn for vectorized environments. Defaults to True.
 
         Returns:
-            SubprocVecEnv: the vectorized environment
+            gym.vector.AsyncVectorEnv: the vectorized environment
         """
 
-        env = make_vec_env(
-            senv.env_id,
-            n_envs=num_envs,
-            seed=self._seed,
-            vec_env_cls=SubprocVecEnv,
-            env_kwargs={
-                "obs_mode": senv.obs_mode,
-                "control_mode": senv.control_mode,
-            },
+        env: gym.vector.AsyncVectorEnv = gym.make_vec(
+            id=senv.env_id, num_envs=num_envs, vector_kwargs={"context": "forkserver"}
         )
-        env.reset()
-        env.seed(self._seed)
-        env.env_method("set_state", senv.state)
+        env.reset(seed=self._seed)
+        env.call("set_state", senv.state)
 
         return env
 
@@ -176,8 +167,8 @@ class CEM(BasePlanner):
             num_iters = self.num_wip_envs
 
         for i in range(num_iters):
-            self._wip_envs.reset()
-            self._wip_envs.env_method("set_state", state)
+            self._wip_envs.reset(seed=self._seed)
+            self._wip_envs.call("set_state", state)
 
             if self._wip_envs.num_envs != self.population:
                 _samples = samples[i * self.num_wip_envs : (i + 1) * self.num_wip_envs]
@@ -185,7 +176,7 @@ class CEM(BasePlanner):
                 _samples = samples
 
             for j in range(self.horizon):
-                _, reward, _, _ = self._wip_envs.step(_samples[:, j])
+                _, reward, _, _, _ = self._wip_envs.step(_samples[:, j])
                 reward_per_step[
                     i * self.num_wip_envs : (i + 1) * self.num_wip_envs, j
                 ] = reward[: _samples.shape[0]]
