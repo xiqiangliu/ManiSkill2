@@ -23,7 +23,8 @@ SUPPORTED_REWARD_TEMPLATES = {
             "        self.scene = scene",
             '        self.target_actor = self.scene.find_actor_by_id("ID_OF_TARGET_ACTOR")\n',
             "    def compute(self):",
-            "        return np.linalg.norm(self.env.tcp.pose.p - self.target_actor.pose.p)",
+            "        # We maximize the negative L2 distance between the TCP and the target actor",
+            "        return -np.linalg.norm(self.env.tcp.pose.p - self.target_actor.pose.p)",
         ]
     ),
 }

@@ -49,7 +49,7 @@ class MSDuration(R.UIDuration):
         self._name = name
 
         self.definition = ""
-        self.reward = None
+        self.trajectory = {"actions": None, "states": None, "control_mode": None}
 
     def keyframe0(self):
         return self._keyframe0
@@ -216,42 +216,7 @@ class MSKeyframeWindow(Plugin):
     def confirm_popup_duration(self, _):
         self.edited_duration.set_name(self.popup_duration.get_children()[2].value)
         self.edited_duration.definition = self.popup_duration.get_children()[3].value
-
-        self.edited_duration.reward = self._parse_definition(
-            self.edited_duration.definition
-        )
         self.close_popup_duration()
-
-    def _parse_definition(self, definition: str):
-        definition_ast = ast.parse(definition)
-
-        # check if definition contains template class
-        for node in definition_ast.body:
-            if isinstance(node, ast.ClassDef):
-                if node.name == "Reward":
-                    reward_class = node
-                    break
-        else:
-            logger.warning("Invalid reward definition! Does not contain Reward class.")
-            return None
-
-        # check if definition contains compute method
-        for node in reward_class.body:
-            if isinstance(node, ast.FunctionDef):
-                if node.name == "compute":
-                    break
-        else:
-            logger.warning(
-                "Invalid reward definition! Does not contain compute method."
-            )
-            return None
-
-        definition_ast.body += ast.parse(
-            "reward_obj = Reward(scene = scene, env = env)"
-        ).body
-        scope = {"scene": self.scene, "env": self.env}
-        exec(compile(definition_ast, "<string>", "exec"), scope)
-        return scope["reward_obj"]
 
     def cancel_popup_duration(self, _):
         self.close_popup_duration()
@@ -330,7 +295,7 @@ class MSKeyframeWindow(Plugin):
                 .Max(2.0),
                 R.UIInputInt()
                 .Label("# of Rollout Environments")
-                .Bind(self._backend_cfg_tmp, "num_wip_envs"),
+                .Bind(self._backend_cfg_tmp, "num_rollout_envs"),
                 R.UIInputInt()
                 .Label("Seed (-1 for No Seed)")
                 .Bind(self._backend_cfg_tmp, "seed_ui"),
@@ -501,17 +466,15 @@ class MSKeyframeWindow(Plugin):
             return
 
         logger.info("Planning trajectory with %s backend.", self._backend)
-        _, _, (serialize_keyframes, serialized_durations) = self.get_editor_state()
-        serialize_keyframes
         if self._backend == "CEM":
             # avoid circular import
             from ..editing.planner.mpc.cem import CEM
 
-            for kf1_id, kf2_id, name, duration in serialized_durations:
-                senv_1 = serialize_keyframes[kf1_id][0]
-                senv_2 = serialize_keyframes[kf2_id][0]
-
-                cfg = copy.deepcopy(self._backend_cfg)
-                cfg.sample_env = senv_1
-                planner = CEM(**cfg.to_dict())
-                traj = planner.plan(senv_1, senv_2, duration)
+            planner = CEM(**self._backend_cfg.to_dict())
+            duration: MSDuration
+            for duration in self.keyframe_editor.get_durations():
+                planner.reset(senv=duration.keyframe0().serialized_env)
+                if planner.plan(duration):
+                    duration.trajectory["actions"] = planner.current_actions
+                    duration.trajectory["states"] = planner.current_states
+                    duration.trajectory["control_mode"] = planner.control_mode

@@ -1,6 +1,5 @@
 import numpy as np
 import sapien.core as sapien
-from gym.spaces import Dict
 from sapien.utils.viewer.serialization import SerializedScene as _SerializedScene
 
 from mani_skill2.envs.sapien_env import BaseEnv
@@ -13,7 +12,7 @@ class SerializedEnv(_SerializedScene):
         self._env_id: str = env.spec.id
         self._sim_freq: float = env.sim_freq
         self._control_freq: float = env.control_freq
-        self._action_space: Dict = env.agent.action_space
+        # self._action_space: Dict = env.agent.action_space  # NOTE: this not being used!
         self._control_mode: str = env.control_mode
         self._obs_mode: str = env.obs_mode
         self._state: np.ndarray = env.get_state()
@@ -30,9 +29,9 @@ class SerializedEnv(_SerializedScene):
     def control_mode(self):
         return self._control_mode
 
-    @property
-    def action_space(self):
-        return self._action_space
+    # @property
+    # def action_space(self):
+    #     return self._action_space
 
     @property
     def obs_mode(self):

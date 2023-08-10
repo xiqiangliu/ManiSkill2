@@ -1,3 +1,4 @@
+import ast
 import os
 from collections import OrderedDict
 from typing import Dict, Optional, Sequence, Union
@@ -157,6 +158,7 @@ class BaseEnv(gym.Env):
         if reward_mode not in self.SUPPORTED_REWARD_MODES:
             raise NotImplementedError("Unsupported reward mode: {}".format(reward_mode))
         self._reward_mode = reward_mode
+        self._custom_reward = None
 
         # Control mode
         self._control_mode = control_mode
@@ -349,6 +351,41 @@ class BaseEnv(gym.Env):
 
     def compute_normalized_dense_reward(self, **kwargs):
         raise NotImplementedError
+
+    def set_custom_reward(self, definition: str):
+        """Set custom reward function."""
+        definition_ast = ast.parse(definition)
+
+        # check if definition contains template class
+        for node in definition_ast.body:
+            if isinstance(node, ast.ClassDef):
+                if node.name == "Reward":
+                    reward_class = node
+                    break
+        else:
+            logger.warning("Invalid reward definition! Does not contain Reward class.")
+            return None
+
+        # check if definition contains compute method
+        for node in reward_class.body:
+            if isinstance(node, ast.FunctionDef):
+                if node.name == "compute":
+                    break
+        else:
+            logger.warning(
+                "Invalid reward definition! Does not contain compute method."
+            )
+            return None
+
+        definition_ast.body += ast.parse(
+            "reward_obj = Reward(scene = scene, env = env)"
+        ).body
+        scope = {"scene": self._scene, "env": self}
+        exec(compile(definition_ast, "<string>", "exec"), scope)
+        self._custom_reward = scope["reward_obj"]
+
+    def get_custom_reward(self, **kwargs) -> float:
+        return self._custom_reward.compute()
 
     # -------------------------------------------------------------------------- #
     # Reconfigure

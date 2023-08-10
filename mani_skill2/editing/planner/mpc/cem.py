@@ -1,3 +1,4 @@
+import copy
 import multiprocessing as mp
 from types import SimpleNamespace
 from typing import Optional
@@ -9,7 +10,7 @@ from scipy.stats import truncnorm
 from tqdm.auto import trange
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from mani_skill2.editing.keyframe_editor import MSDuration, MSKeyFrame
+from mani_skill2.editing.keyframe_editor import MSDuration
 from mani_skill2.editing.serialization import SerializedEnv
 from mani_skill2.utils.logging_utils import logger
 
@@ -20,12 +21,11 @@ class CEMConfig(SimpleNamespace):
     def __init__(self, **kwargs):
         self.population = 200
         self.elite = 20
-        self.sample_env = None
         self.horizon = 30
         self.cem_iter = 4
         self.lr = 1.0
         self.use_history = True
-        self.num_wip_envs = mp.cpu_count()
+        self.num_rollout_envs = mp.cpu_count()
         self.record_dir = None
         self.seed = None
         self.engine = None
@@ -50,18 +50,36 @@ class CEMConfig(SimpleNamespace):
 
 
 class CEM(BasePlanner):
-    """Cross Entropy Method Planner"""
+    """Cross Entropy Method Planner.
+
+    Args:
+        population (int): the population size
+        elite (int): the number of elite samples
+        horizon (int): the planning horizon
+        cem_iter (int): the number of CEM iterations
+        lr (float): the learning rate
+        use_history (bool): whether to use the history of previous actions
+        num_rollout_envs (int): the number of rollout environments
+        record_dir (str): the directory to save the recordings
+        seed (int): the random seed
+        engine (sapien.Engine): the simulation engine
+
+    Note:
+        Regardless of the control mode of the original serialized environment, CEM
+        always generate actions in `pd_joint_delta_pos` control mode.
+    """
+
+    SUPPORTED_CONTROL_MODE = {"pd_joint_delta_pos"}
 
     def __init__(
         self,
         population: int,
         elite: int,
-        sample_env: SerializedEnv,
         horizon: int,
         cem_iter: int = 10,
         lr: float = 1.0,
         use_history: bool = True,
-        num_wip_envs: int = mp.cpu_count(),
+        num_rollout_envs: int = mp.cpu_count(),
         record_dir: Optional[str] = None,
         seed: Optional[int] = None,
         engine: Optional[sapien.Engine] = None,
@@ -72,23 +90,31 @@ class CEM(BasePlanner):
         self.cem_iter = cem_iter
         self.lr = lr
         self.use_history = use_history
-        self.num_wip_envs = num_wip_envs
+        self.num_rollout_envs = num_rollout_envs
         self._truncnorm = None
 
-        super().__init__(
-            senv=sample_env, seed=seed, engine=engine, record_dir=record_dir
-        )
+        super().__init__(seed=seed, engine=engine, record_dir=record_dir)
 
     def reset(self, senv: SerializedEnv):
+        if senv.control_mode not in self.SUPPORTED_CONTROL_MODE:
+            logger.warning(
+                "Unsupported control mode %s. "
+                "Control signals generated with CEM will use `pd_joint_delta_pos` instead.",
+                senv.control_mode,
+            )
+
+        senv = copy.deepcopy(senv)
+        senv._control_mode = "pd_joint_delta_pos"
         super().reset(senv)
 
-        if hasattr(self, "_wip_envs") and isinstance(
-            self._wip_envs, gym.vector.AsyncVectorEnv
+        if hasattr(self, "_rollout_env") and isinstance(
+            self._rollout_env, gym.vector.AsyncVectorEnv
         ):
-            self._wip_envs.close()
-        self._wip_envs = self._duplicate_envs(senv, self.num_wip_envs)
+            self._rollout_env.close()
+        self._rollout_env = self._duplicate_envs(senv, self.num_rollout_envs)
 
         self.current_actions = None
+        self.current_states = None
 
         # Initial distribution
         # NOTE: we only support environments with single controller for now
@@ -115,18 +141,18 @@ class CEM(BasePlanner):
         logger.info("Gracefully shutdown rollout envs. Timeout = 10s")
 
         try:
-            self._wip_envs.call_wait(timeout=10)
+            self._rollout_env.call_wait(timeout=10)
         except gym.error.NoAsyncCallError:
             pass
         except mp.TimeoutError:
             logger.warning(
                 "Timeout when gracefully closing rollout envs. Force closing now!"
             )
-            self._wip_envs.close()
+            self._rollout_env.close()
             return
 
         try:
-            self._wip_envs.step_wait(timeout=10)
+            self._rollout_env.step_wait(timeout=10)
         except gym.error.NoAsyncCallError:
             pass
         except mp.TimeoutError:
@@ -134,27 +160,29 @@ class CEM(BasePlanner):
                 "Timeout when gracefully closing rollout envs. Force closing now!"
             )
 
-        self._wip_envs.close()
+        self._rollout_env.close()
 
     def _duplicate_envs(
         self,
         senv: SerializedEnv,
         num_envs: int,
-        spawn: bool = True,
     ) -> gym.vector.AsyncVectorEnv:
         """Generate VecEnv for internal evaluation use.
 
         Args:
             senv (SerializedEnv): the serialized environment
             num_scenes (int): the number of scenes to be duplicated
-            spawn (bool, optional): whether to use spawn for vectorized environments. Defaults to True.
 
         Returns:
             gym.vector.AsyncVectorEnv: the vectorized environment
         """
 
         env: gym.vector.AsyncVectorEnv = gym.make_vec(
-            id=senv.env_id, num_envs=num_envs, vector_kwargs={"context": "forkserver"}
+            id=senv.env_id,
+            num_envs=num_envs,
+            vector_kwargs={"context": "forkserver"},
+            control_mode=senv.control_mode,
+            obs_mode="none",  # we don't need observations at all for CEM-MPC
         )
         env.reset(seed=self._seed)
         env.call("set_state", senv.state)
@@ -174,9 +202,9 @@ class CEM(BasePlanner):
 
         reward_per_step = np.zeros(shape=(self.population, self.horizon))
 
-        if self.num_wip_envs != self.population:
-            num_iters = self.population // self.num_wip_envs
-            if self.population % self.num_wip_envs != 0:
+        if self.num_rollout_envs != self.population:
+            num_iters = self.population // self.num_rollout_envs
+            if self.population % self.num_rollout_envs != 0:
                 num_iters += 1
 
                 if not self._odd_batch_warning:
@@ -186,37 +214,42 @@ class CEM(BasePlanner):
                     )
                     self._odd_batch_warning = True
         else:
-            num_iters = self.num_wip_envs
+            num_iters = self.num_rollout_envs
 
         for i in range(num_iters):
-            self._wip_envs.reset(seed=self._seed)
-            self._wip_envs.call("set_state", state)
+            self._rollout_env.reset(seed=self._seed)
+            self._rollout_env.call("set_state", state)
 
-            if self._wip_envs.num_envs != self.population:
-                _samples = samples[i * self.num_wip_envs : (i + 1) * self.num_wip_envs]
+            if self._rollout_env.num_envs != self.population:
+                _samples = samples[
+                    i * self.num_rollout_envs : (i + 1) * self.num_rollout_envs
+                ]
             else:
                 _samples = samples
 
             for j in range(self.horizon):
-                _, reward, _, _, _ = self._wip_envs.step(_samples[:, j])
+                self._rollout_env.step(_samples[:, j])
+                reward = self._rollout_env.call("get_custom_reward")
                 reward_per_step[
-                    i * self.num_wip_envs : (i + 1) * self.num_wip_envs, j
+                    i * self.num_rollout_envs : (i + 1) * self.num_rollout_envs, j
                 ] = reward[: _samples.shape[0]]
 
         return reward_per_step
 
-    def plan(self, kf_1: MSKeyFrame, kf_2: MSKeyFrame, duration: MSDuration):
+    def plan(self, duration: MSDuration):
         """Plan a trajectory from keyframe to keyframe.
 
         Args:
-            kf_1 (MSKeyFrame): the first keyframe
-            kf_2 (MSKeyFrame): the second keyframe
+            duration (MSDuration): the duration to be planned
         """
 
-        if not self._wip_envs or not self._eval_env:
+        if not self._rollout_env or not self._eval_env:
             raise RuntimeError("The planner has not been reset yet.")
 
+        kf_1, kf_2 = duration.keyframe0(), duration.keyframe1()
         allowed_frames = kf_2.frame() - kf_1.frame()
+        self._rollout_env.call("set_custom_reward", duration.definition)
+        self._eval_env.set_custom_reward(duration.definition)
 
         with logging_redirect_tqdm(loggers=[logger]):
             logger.info("Planning %i frames between keyframes.", allowed_frames)
@@ -227,6 +260,9 @@ class CEM(BasePlanner):
             )
 
             current_state = kf_1.serialized_env.state
+            self.current_states = np.zeros(
+                shape=(allowed_frames,) + current_state.shape
+            )
             for i in trange(allowed_frames, dynamic_ncols=True):
                 self.step = i
 
@@ -244,6 +280,7 @@ class CEM(BasePlanner):
 
                 current_state = self._eval_env.get_state()
                 self.current_actions[i] = optimized_action
+                self.current_states[i] = current_state
             else:
                 return False
 

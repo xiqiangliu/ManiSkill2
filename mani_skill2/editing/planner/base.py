@@ -5,7 +5,7 @@ import gymnasium as gym
 import numpy as np
 import sapien.core as sapien
 
-from mani_skill2.editing.keyframe_editor import MSDuration, MSKeyFrame
+from mani_skill2.editing.keyframe_editor import MSDuration
 from mani_skill2.editing.serialization import SerializedEnv
 from mani_skill2.utils.logging_utils import logger
 from mani_skill2.utils.wrappers import RecordEpisode
@@ -21,9 +21,10 @@ class BasePlanner:
         record_dir (str): the directory to save the recordings. If None, no recordings will be saved.
     """
 
+    SUPPORTED_CONTROL_MODE = {}
+
     def __init__(
         self,
-        senv: SerializedEnv,
         engine: Optional[sapien.Engine] = None,
         seed: Optional[int] = None,
         record_dir: Union[str, os.PathLike, None] = None,
@@ -32,9 +33,7 @@ class BasePlanner:
         self._rng = np.random.default_rng(seed)
         self.record_dir = record_dir
 
-        self.reset(senv)
-
-    def plan(self, kf_1: MSKeyFrame, kf_2: MSKeyFrame, duration: MSDuration, **kwargs):
+    def plan(self, duration: MSDuration):
         raise NotImplementedError
 
     def reset(self, senv: SerializedEnv):
@@ -62,9 +61,7 @@ class BasePlanner:
 
         self.cumulative_eval_reward = 0
         self.step = 0
-
-        assert isinstance(senv.action_space, gym.Space)
-        self.action_space = senv.action_space
+        self.action_space = self._eval_env.action_space
 
         logger.info(
             "Resetted %s planner with evaluation environment seeded at %i",
@@ -106,3 +103,7 @@ class BasePlanner:
         )
 
         return True
+
+    @property
+    def control_mode(self) -> str:
+        return self._eval_env.control_mode
