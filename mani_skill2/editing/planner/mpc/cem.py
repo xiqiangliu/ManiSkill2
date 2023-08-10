@@ -276,13 +276,11 @@ class CEM(BasePlanner):
 
                 if not self.execute(optimized_action):
                     logger.error("Failed to execute the optimized action.")
-                    break
+                    return False
 
                 current_state = self._eval_env.get_state()
                 self.current_actions[i] = optimized_action
                 self.current_states[i] = current_state
-            else:
-                return False
 
         return True
 

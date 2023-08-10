@@ -1,8 +1,8 @@
-import ast
 import copy
 import os
 import shutil
 import tempfile
+from collections import defaultdict
 from collections.abc import Iterable
 
 import sapien.core as sapien
@@ -49,7 +49,7 @@ class MSDuration(R.UIDuration):
         self._name = name
 
         self.definition = ""
-        self.trajectory = {"actions": None, "states": None, "control_mode": None}
+        self.trajectory = defaultdict(str)
 
     def keyframe0(self):
         return self._keyframe0
@@ -215,6 +215,7 @@ class MSKeyframeWindow(Plugin):
 
     def confirm_popup_duration(self, _):
         self.edited_duration.set_name(self.popup_duration.get_children()[2].value)
+        # TODO: Use AST to pre-check syntax validity
         self.edited_duration.definition = self.popup_duration.get_children()[3].value
         self.close_popup_duration()
 
@@ -395,6 +396,7 @@ class MSKeyframeWindow(Plugin):
                 R.UIButton()
                 .Label("Planner Configuration")
                 .Callback(self.open_popup_planner_cfg),
+                R.UIButton().Label("Play Duration").Callback(self.play_duration),
             )
         )
 
@@ -408,6 +410,8 @@ class MSKeyframeWindow(Plugin):
         print(self.keyframes)
 
     def add_duration(self, frame0: MSKeyFrame, frame1: MSKeyFrame):
+        if frame0.frame() > frame1.frame():
+            frame0, frame1 = frame1, frame0
         duration = MSDuration(frame0, frame1, "New Reward")
         self.keyframe_editor.add_duration(duration)
 
@@ -478,3 +482,17 @@ class MSKeyframeWindow(Plugin):
                     duration.trajectory["actions"] = planner.current_actions
                     duration.trajectory["states"] = planner.current_states
                     duration.trajectory["control_mode"] = planner.control_mode
+
+    def play_duration(self, _):
+        if self.edited_duration is None:
+            logger.warning("No duration is selected!")
+            return
+
+        self.load_keyframe(self.edited_duration.keyframe0())
+        if len(trajectory := self.edited_duration.trajectory) == 0:
+            logger.warning("No trajectory is planned. Please plan one first!")
+            return
+
+        for state in trajectory["states"]:
+            self.env.set_state(state)
+            self.env.render()
