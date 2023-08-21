@@ -1,10 +1,13 @@
 import copy
 import os
+import pickle
 import shutil
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterable
+from pathlib import Path
 
+import numpy as np
 import sapien.core as sapien
 from sapien.core import renderer as R
 from sapien.utils.viewer.plugin import Plugin
@@ -63,6 +66,20 @@ class MSDuration(R.UIDuration):
     def set_name(self, name):
         self._name = name
 
+    @classmethod
+    def deserialize(
+        cls,
+        keyframe0: MSKeyFrame,
+        keyframe1: MSKeyFrame,
+        name: str,
+        definition: str,
+        trajectory: dict[str, np.ndarray],
+    ):
+        ins = cls(keyframe0, keyframe1, name)
+        ins.definition = definition
+        ins.trajectory = trajectory
+        return ins
+
 
 def serialize_keyframes(
     keyframes: Iterable[MSKeyFrame], durations: Iterable[MSDuration]
@@ -80,7 +97,8 @@ def serialize_keyframes(
     s_keyframes = [(f.serialized_env, f.frame()) for f in keyframes]
     f2i = dict((f, i) for i, f in enumerate(keyframes))
     s_durations = [
-        (f2i[d._keyframe0], f2i[d._keyframe1], d._name, d.definition) for d in durations
+        (f2i[d._keyframe0], f2i[d._keyframe1], d._name, d.definition, d.trajectory)
+        for d in durations
     ]
 
     return s_keyframes, s_durations
@@ -105,8 +123,10 @@ def deserialize_keyframes(
 
     keyframes = [MSKeyFrame(*f) for f in s_keyframes]
     durations = [
-        MSDuration(keyframes[k1_idx], keyframes[k2_idx], name, definition)
-        for k1_idx, k2_idx, name, definition in s_durations
+        MSDuration.deserialize(
+            keyframes[k1_idx], keyframes[k2_idx], name, definition, trajectory
+        )
+        for k1_idx, k2_idx, name, definition, trajectory in s_durations
     ]
     return keyframes, durations
 
@@ -126,6 +146,9 @@ class MSKeyframeWindow(Plugin):
 
     popup_planner_cfg: R.UIPopup
     show_popup_planner_cfg: bool
+
+    file_chooser: R.UIFileChooser
+    export_file: bool
 
     keyframe_editor: R.UIKeyframeEditor
     key_frame_envs: list[MSKeyFrame]
@@ -166,6 +189,9 @@ class MSKeyframeWindow(Plugin):
         self._backend = None
         self._backend_cfg = None
         self._backend_cfg_tmp = None
+
+        self.file_chooser = None
+        self.export_file = False
 
         self.keyframe_editor = None
         self.key_frame_envs = []
@@ -400,6 +426,10 @@ class MSKeyframeWindow(Plugin):
             )
         )
 
+        self.file_chooser = (
+            R.UIFileChooser().Callback(self.import_export_callback).Filter(".pkl")
+        )
+
         self.ui_window = (
             R.UIWindow().Label("Key Frame Editor").append(self.keyframe_editor)
         )
@@ -437,6 +467,8 @@ class MSKeyframeWindow(Plugin):
             windows.append(self.popup_no_editor)
         if self.show_popup_planner_cfg:
             windows.append(self.popup_planner_cfg)
+        if self.file_chooser:
+            windows.append(self.file_chooser)
         return windows
 
     def get_editor_state(self):
@@ -454,10 +486,12 @@ class MSKeyframeWindow(Plugin):
         self.keyframe_editor.set_state(keyframes, durations)
 
     def editor_export(self, _):
-        self._state = self.get_editor_state()
+        self.export_file = True
+        self.file_chooser.open()
 
     def editor_import(self, _):
-        self.set_editor_state(self._state)
+        self.export_file = False
+        self.file_chooser.open()
 
     def plan_traj(self, _):
         """Plan a trajectory using the serialized keyframes and durations in the editor"""
@@ -494,3 +528,14 @@ class MSKeyframeWindow(Plugin):
             return
 
         self.env.play_trajectory(trajectory)
+
+    def import_export_callback(
+        self, file_chooser: R.UIFileChooser, filepath: str, dirpath: str
+    ):
+        file_chooser.close()
+        if self.export_file:
+            with open(filepath, "wb") as f:
+                pickle.dump(self.get_editor_state(), f)
+        else:
+            with open(filepath, "rb") as f:
+                self.set_editor_state(pickle.load(f))
