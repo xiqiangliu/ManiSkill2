@@ -169,6 +169,8 @@ class BaseEnv(gym.Env):
         # Render mode
         self.render_mode = render_mode
         self._viewer = None
+        self._pending_states = None
+        self._current_playing_index = 0
 
         # NOTE(jigu): Agent and camera configurations should not change after initialization.
         self._configure_agent()
@@ -765,6 +767,13 @@ class BaseEnv(gym.Env):
                     _plugins[i] = MSKeyframeWindow()
             self._viewer = Viewer(self._renderer, plugins=_plugins)
             self._setup_viewer()
+
+        if self._pending_states is not None and self._current_playing_index < len(
+            self._pending_states
+        ):
+            self.set_state(self._pending_states[self._current_playing_index])
+            self._current_playing_index += 1
+
         self._viewer.render()
         return self._viewer
 
@@ -843,3 +852,13 @@ class BaseEnv(gym.Env):
         scene_mesh = merge_meshes(meshes)
         scene_pcd = scene_mesh.sample(num_points)
         return scene_pcd
+
+    def play_trajectory(self, trajectory: dict[str, np.ndarray], delay: int = 100):
+        """Play a trajectory in the environment.
+
+        Args:
+            trajectory: A dictionary of joint trajectories.
+        """
+
+        self._pending_states = trajectory["states"]
+        self._current_playing_index = 0

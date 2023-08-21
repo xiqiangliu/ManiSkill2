@@ -493,6 +493,4 @@ class MSKeyframeWindow(Plugin):
             logger.warning("No trajectory is planned. Please plan one first!")
             return
 
-        for state in trajectory["states"]:
-            self.env.set_state(state)
-            self.env.render()
+        self.env.play_trajectory(trajectory)
