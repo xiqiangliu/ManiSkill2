@@ -1,13 +1,14 @@
 import copy
+import importlib
+import multiprocessing as mp
 import os
 import pickle
 import shutil
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterable
-from pathlib import Path
+from multiprocessing.connection import Connection
 
-import numpy as np
 import sapien.core as sapien
 from sapien.core import renderer as R
 from sapien.utils.viewer.plugin import Plugin
@@ -20,12 +21,18 @@ from .serialization import SerializedEnv
 
 
 class MSKeyFrame(R.UIKeyframe):
-    """ManiSkill2-compatible KeyFrame Implementation"""
+    """ManiSkill2-compatible KeyFrame Implementation
+
+    Args:
+        serialized_env: A SerializedEnv object that contains the state of the environment.
+        frame: The frame number of this keyframe.
+    """
 
     def __init__(self, serialized_env: SerializedEnv, frame: int = 0):
         super().__init__()
         self.serialized_env = serialized_env
         self._frame = frame
+        self.alone = True
 
     def frame(self):
         return self._frame
@@ -36,9 +43,28 @@ class MSKeyFrame(R.UIKeyframe):
     def __repr__(self):
         return f"Keyframe(scene, frame={self.frame()})"
 
+    @classmethod
+    def deserialize(cls, state: dict):
+        instance = cls(serialized_env=state["serialized_env"], frame=state["frame"])
+        instance.alone = state["alone"]
+        return instance
+
+    def serialize(self):
+        return {
+            "serialized_env": self.serialized_env,
+            "frame": self._frame,
+            "alone": self.alone,
+        }
+
 
 class MSDuration(R.UIDuration):
-    """ManiSkill2-compatible Duration Implementation"""
+    """ManiSkill2-compatible Duration Implementation
+
+    Args:
+        keyframe0: The first keyframe of this duration.
+        keyframe1: The second keyframe of this duration.
+        name: The name of this duration.
+    """
 
     def __init__(
         self,
@@ -66,19 +92,46 @@ class MSDuration(R.UIDuration):
     def set_name(self, name):
         self._name = name
 
+    def __repr__(self):
+        return (
+            f"MSDuration Keyframe0: {self._keyframe0.frame()}, "
+            + f"Keyframe1: {self._keyframe1.frame()}, Name: {self._name}"
+        )
+
     @classmethod
-    def deserialize(
-        cls,
-        keyframe0: MSKeyFrame,
-        keyframe1: MSKeyFrame,
-        name: str,
-        definition: str,
-        trajectory: dict[str, np.ndarray],
-    ):
-        ins = cls(keyframe0, keyframe1, name)
-        ins.definition = definition
-        ins.trajectory = trajectory
-        return ins
+    def deserialize(cls, state: dict, keyframes: list[MSKeyFrame] = None):
+        keyframe_0, keyframe_1 = None, None
+
+        if keyframes is not None:
+            frame_0 = state["keyframe_0"]["frame"]
+            frame_1 = state["keyframe_1"]["frame"]
+
+            for keyframe in keyframes:
+                if keyframe.frame() == frame_0:
+                    keyframe_0 = keyframe
+                if keyframe.frame() == frame_1:
+                    keyframe_1 = keyframe
+
+        if keyframe_0 is None:
+            keyframe_0: MSKeyFrame = MSKeyFrame.deserialize(state["keyframe_0"])
+        if keyframe_1 is None:
+            keyframe_1: MSKeyFrame = MSKeyFrame.deserialize(state["keyframe_1"])
+        keyframe_0.alone, keyframe_1.alone = False, False
+
+        instance = cls(keyframe_0, keyframe_1, state["name"])
+        instance.definition = state["definition"]
+        instance.trajectory = state["trajectory"]
+
+        return instance
+
+    def serialize(self):
+        return {
+            "keyframe_0": self._keyframe0.serialize(),
+            "keyframe_1": self._keyframe1.serialize(),
+            "name": self._name,
+            "definition": self.definition,
+            "trajectory": self.trajectory,
+        }
 
 
 def serialize_keyframes(
@@ -94,12 +147,8 @@ def serialize_keyframes(
         state: A state that can be saved to disk
     """
 
-    s_keyframes = [(f.serialized_env, f.frame()) for f in keyframes]
-    f2i = dict((f, i) for i, f in enumerate(keyframes))
-    s_durations = [
-        (f2i[d._keyframe0], f2i[d._keyframe1], d._name, d.definition, d.trajectory)
-        for d in durations
-    ]
+    s_keyframes = [f.serialize() for f in keyframes if f.alone]
+    s_durations = [d.serialize() for d in durations]
 
     return s_keyframes, s_durations
 
@@ -121,13 +170,9 @@ def deserialize_keyframes(
 
     s_keyframes, s_durations = state
 
-    keyframes = [MSKeyFrame(*f) for f in s_keyframes]
-    durations = [
-        MSDuration.deserialize(
-            keyframes[k1_idx], keyframes[k2_idx], name, definition, trajectory
-        )
-        for k1_idx, k2_idx, name, definition, trajectory in s_durations
-    ]
+    keyframes = [MSKeyFrame.deserialize(state) for state in s_keyframes]
+    durations = [MSDuration.deserialize(state, keyframes) for state in s_durations]
+
     return keyframes, durations
 
 
@@ -202,6 +247,10 @@ class MSKeyframeWindow(Plugin):
         self.total_frames = 32
         self._env = None
 
+        self.ctx = mp.get_context("spawn")
+        self.current_connection = None
+        self.current_process = None
+
     def close(self):
         self.reset()
 
@@ -226,14 +275,19 @@ class MSKeyframeWindow(Plugin):
     def duration_definition_overwrite(self, _):
         # HACK: Just calling box.Value(...) is not enough because while the part of the
         # old string that's longer than the new string will not be overwritten.
+        if self.edited_duration.definition == "":
+            fill_value = SUPPORTED_REWARD_TEMPLATES[
+                self.popup_duration.get_children()[1].value
+            ]
+        else:
+            fill_value = self.edited_duration.definition
+
         self.popup_duration.get_children()[3].remove()
         self.popup_duration.append(
             R.UIInputTextMultiline()
             .Label("Definition")
             .Callback(self.duration_definition_change)
-            .Value(
-                SUPPORTED_REWARD_TEMPLATES[self.popup_duration.get_children()[1].value]
-            )
+            .Value(fill_value)
         )
 
     def duration_definition_change(self, text):
@@ -449,10 +503,16 @@ class MSKeyframeWindow(Plugin):
         frame.set_frame(time)
 
     def load_keyframe(self, frame: MSKeyFrame):
+        if self.current_process is not None:
+            logger.warning("Cannot load other keyframes while planning!")
+            return
         s_env = frame.serialized_env
         s_env.dump_state_into(self.scene)
 
     def edit_duration(self, duration):
+        if self.current_process is not None:
+            logger.warning("Cannot edit other durations while planning!")
+            return
         self.edited_duration = duration
         self.open_popup_duration()
 
@@ -495,7 +555,6 @@ class MSKeyframeWindow(Plugin):
 
     def plan_traj(self, _):
         """Plan a trajectory using the serialized keyframes and durations in the editor"""
-
         if self._backend is None:
             self.open_popup_planner_cfg(_)
             logger.warning(
@@ -504,18 +563,17 @@ class MSKeyframeWindow(Plugin):
             return
 
         logger.info("Planning trajectory with %s backend.", self._backend)
+        cfg_subproc = self._backend_cfg.to_dict()
         if self._backend == "CEM":
-            # avoid circular import
-            from ..editing.planner.mpc.cem import CEM
-
-            planner = CEM(**self._backend_cfg.to_dict())
-            duration: MSDuration
-            for duration in self.keyframe_editor.get_durations():
-                planner.reset(senv=duration.keyframe0().serialized_env)
-                if planner.plan(duration):
-                    duration.trajectory["actions"] = planner.current_actions
-                    duration.trajectory["states"] = planner.current_states
-                    duration.trajectory["control_mode"] = planner.control_mode
+            cfg_subproc["name"] = "mpc.CEM"
+        for duration in self.keyframe_editor.get_durations():
+            self.current_connection, child_pipe = self.ctx.Pipe()
+            self.current_process = self.ctx.Process(
+                target=planner_worker_fn,
+                args=(cfg_subproc, child_pipe, duration.serialize()),
+            )
+            logger.info("Starting planner worker process for duration %s", duration)
+            self.current_process.start()
 
     def play_duration(self, _):
         if self.edited_duration is None:
@@ -535,7 +593,39 @@ class MSKeyframeWindow(Plugin):
         file_chooser.close()
         if self.export_file:
             with open(filepath, "wb") as f:
-                pickle.dump(self.get_editor_state(), f)
+                data = self._backend, self._backend_cfg, self.get_editor_state()
+                pickle.dump(data, f)
         else:
             with open(filepath, "rb") as f:
-                self.set_editor_state(pickle.load(f))
+                self._backend, self._backend_cfg, state = pickle.load(f)
+                self.set_editor_state(state)
+
+    def before_render(self):
+        super().before_render()
+        if self.current_process is not None:
+            if not self.current_process.is_alive():
+                serialized_duration = self.current_connection.recv()
+                self.edited_duration.trajectory = serialized_duration["trajectory"]
+                self.current_process.close()
+                self.current_connection.close()
+                self.current_process = None
+                self.current_connection = None
+                logger.info("Planner worker process finished.")
+
+
+def planner_worker_fn(planner_cfg: dict, conn: Connection, duration_state: dict):
+    module, cls = f"..planner.{planner_cfg['name']}".rsplit(".", 1)
+    module = importlib.import_module(module, package=__name__)
+    planner_cls = getattr(module, cls)
+    del planner_cfg["name"]
+
+    duration = MSDuration.deserialize(duration_state)
+    planner = planner_cls(**planner_cfg)
+    planner.reset(duration.keyframe0().serialized_env)
+
+    if planner.plan(duration):
+        duration.trajectory["actions"] = planner.current_actions
+        duration.trajectory["states"] = planner.current_states
+        duration.trajectory["control_mode"] = planner.control_mode
+
+    conn.send(duration.serialize())
